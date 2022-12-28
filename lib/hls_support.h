@@ -4,7 +4,7 @@
 
 namespace HLS{
   // TODO: Implement logic to detect ideal partial fragment size
-  const uint32_t partDurationMaxMs = 500; ///< max partial fragment duration in ms
+  const uint32_t partDurationMaxMs = 1500; ///< max partial fragment duration in ms
 
   /// A struct containing data regarding fragments in a particular track
   /// needed for media manifest generation
