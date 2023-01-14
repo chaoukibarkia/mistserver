@@ -1,4 +1,4 @@
-project('mistserver', 'cpp', default_options: ['cpp_std=gnu++03'])
+project('mistserver', 'cpp', default_options: ['cpp_std=c++98'])
 add_project_arguments(['-funsigned-char', '-D_LARGEFILE_SOURCE','-Wno-sign-compare', '-Wparentheses', '-Wno-non-virtual-dtor', '-Wno-strict-aliasing'], language: 'cpp')
 
 # Ensures the "mist" directory is in the include path
@@ -13,9 +13,19 @@ release = release.strip()
 
 # Grab version number from git, if available
 # Falls back to a file called "VERSION" or the string "Unknown" otherwise
-rv = run_command('git', 'describe', '--tags', check: false)
-version = rv.stdout().strip()
-if rv.returncode() != 0
+git = find_program('git', required: false)
+if git.found()
+  rv = run_command(git, 'describe', '--tags', check: false)
+  version = rv.stdout().strip()
+  if rv.returncode() != 0
+    fs = import('fs') 
+    if fs.is_file('VERSION')
+      version = fs.read('VERSION').strip()
+    else 
+      version = 'Unknown'
+    endif
+  endif
+else
   fs = import('fs') 
   if fs.is_file('VERSION')
     version = fs.read('VERSION').strip()
@@ -40,7 +50,7 @@ option_defines = [
     int_opt.format('UDP_API_PORT', get_option('UDP_API_PORT')),
 ]
 
-if not get_option('NOSHM')
+if not get_option('NOSHM') and host_machine.system() != 'darwin'
   option_defines += '-DSHM_ENABLED=1'
 else
   message('Shared memory use is turned OFF')
@@ -82,36 +92,70 @@ if get_option('NOLLHLS')
   option_defines += '-DNOLLHLS=1'
 endif
 
-add_project_arguments(option_defines, language: 'cpp')
-
 # End of options
 
 message('Building release @0@ for version @1@ @ debug level @2@'.format(release, version, get_option('DEBUG')))
 
 # Set dependencies
 
-ssl_deps = []
-
-libsrt = false
-if not get_option('NOSRT')
-  libsrt = dependency('srt', required: false)
-endif
-have_srt = not get_option('NOSRT') and libsrt.found()
-
-librist = false
-if not get_option('NORIST')
-  librist = dependency('librist', required: false)
-endif
-have_librist = not get_option('NORIST') and librist.found()
+mist_deps = []
 
 if usessl
   ccpp = meson.get_compiler('cpp')
-  mbedtls = ccpp.find_library('mbedtls')
-  mbedx509 = ccpp.find_library('mbedx509')
-  mbedcrypto = ccpp.find_library('mbedcrypto')
-  srtp2 = dependency('libsrtp2')
-  ssl_deps = [mbedtls, mbedx509, mbedcrypto, srtp2]
+  mbedtls = ccpp.find_library('mbedtls', required: false)
+  mbedx509 = ccpp.find_library('mbedx509', required: false)
+  mbedcrypto = ccpp.find_library('mbedcrypto', required: false)
+
+  # Test if we can compile the way we expect
+  code_ddvtech = '''
+  #include <mbedtls/ssl.h>
+  mbedtls_ssl_srtp_profile srtp_profiles[] ={MBEDTLS_SRTP_AES128_CM_HMAC_SHA1_80,
+                                              MBEDTLS_SRTP_AES128_CM_HMAC_SHA1_32};
+  static int test()
+  {
+    mbedtls_ssl_config ssl_conf;
+    mbedtls_ssl_conf_dtls_srtp_protection_profiles(&ssl_conf, srtp_profiles,
+                                                     sizeof(srtp_profiles) / sizeof(srtp_profiles[0]));
+    return 0;
+  }
+  '''
+  ddvtech_mbedtls = ccpp.compiles(code_ddvtech, dependencies: [mbedtls, mbedx509, mbedcrypto], name: 'MbedTLS is DDVTech fork')
+  if not mbedtls.found() or not ddvtech_mbedtls
+    mbedtls_proj = subproject('mbedtls')
+    mbedtls = mbedtls_proj.get_variable('mbedtls_dep')
+    mbedx509 = mbedtls_proj.get_variable('mbedx509_dep')
+    mbedcrypto = mbedtls_proj.get_variable('mbedcrypto_dep')
+  endif
+
+  mist_deps += [mbedtls, mbedx509, mbedcrypto]
+  mist_deps += dependency('libsrtp2', default_options: ['tests=disabled'], fallback: ['libsrtp2', 'libsrtp2_dep'])
 endif
+
+libsrt = false
+if not get_option('NOSRT') and host_machine.system() != 'darwin'
+  libsrt = dependency('srt', fallback: ['libsrt', 'srt_dep'])
+endif
+have_srt = not get_option('NOSRT') and host_machine.system() != 'darwin' and libsrt.found()
+if have_srt
+  option_defines += '-DWITH_SRT'
+endif
+
+librist = false
+if not get_option('NORIST')
+  librist = dependency('librist', fallback: ['librist', 'librist_dep'], default_options:['test=false', 'built_tools=false'])
+endif
+have_librist = not get_option('NORIST') and librist.found()
+
+# Add thread dependency since we always have thread code in libmist
+mist_deps += dependency('threads')
+
+# Add rt dependency when using shared memory
+if not get_option('NOSHM') and host_machine.system() != 'darwin'
+  mist_deps += ccpp.find_library('rt', required : true)
+endif
+
+# Set defines from active options
+add_project_arguments(option_defines, language: 'cpp')
 
 # Set build targets
 
@@ -137,7 +181,6 @@ foreach exec : executables
   exec_tgts += executable(
     exec.get('name'),
     exec.get('sources'),
-    link_with: exec.get('link'),
     dependencies: exec.get('deps'),
     cpp_args: exec.get('defines'),
     install: true,

@@ -19,12 +19,13 @@ outputs = [
     {'name' : 'RTSP',              'format' : 'rtsp'},
     {'name' : 'WAV',               'format' : 'wav',                'extra': ['http']},
     {'name' : 'SDP',               'format' : 'sdp',                'extra': ['http']},
+    {'name' : 'HTTP',              'format' : 'http_internal',      'extra': ['http','embed']},
 ]
 
 if usessl 
   outputs += [
     {'name' : 'HTTPS', 'format' : 'https'},
-    {'name' : 'WebRTC', 'format' : 'webrtc', 'extra': ['http','jpg']}
+    {'name' : 'WebRTC', 'format' : 'webrtc', 'extra': ['http','jpg','srtp']}
   ]
 endif
 
@@ -37,7 +38,7 @@ if have_srt
 endif
 
 if get_option('WITH_JPG')
-  outputs += {'name' : 'JPG', 'format' : 'jpg', 'extra': ['http','jpg']}
+  outputs += {'name' : 'JPG', 'format' : 'jpg', 'extra': ['http','embed']}
 endif
 
 if get_option('WITH_SANITY')
@@ -53,11 +54,9 @@ output_cpp = files('output.cpp')
 outputs_tgts = []
 
 foreach output : outputs 
-  link_libs = [libmist]
-  deps = []
+  deps = [libmist_dep]
   base = files('mist_out.cpp')
   tsBaseClass = 'Output'
-  extra_tgt_dep = []
 
   sources = [
     files('output.cpp',
@@ -77,7 +76,6 @@ foreach output : outputs
       endif
     endif
     if extra.contains('jpg')
-      extra_tgt_dep = embed_tgts
     endif
     if extra.contains('ts')
       sources += files('output_ts_base.cpp')
@@ -86,24 +84,25 @@ foreach output : outputs
       deps += librist
     endif
     if extra.contains('with_srt')
-      link_libs += libmist_srt
+      deps += libmist_srt_dep
       deps += libsrt
+    endif
+    if extra.contains('srtp')
+      sources += files('output_webrtc_srtp.cpp', 'output_webrtc_srtp.h')
+    endif
+    if extra.contains('embed')
+      sources += embed_tgts
     endif
   else
     sources += base
-  endif
-  if output.get('name').contains('HTTPS')
-    deps += ssl_deps
   endif
 
   executables += {
     'name': 'MistOut'+output.get('name'),
     'sources' : [
       sources,
-      extra_tgt_dep,
       header_tgts
     ],
-    'link' : link_libs,
     'deps' : deps,
     'defines' : [
       string_opt.format('OUTPUTTYPE', 'output_'+output.get('format')+'.h'),
@@ -112,22 +111,3 @@ foreach output : outputs
   }
 endforeach
 
-executables += {
-  'name' : 'MistOutHTTP',
-  'sources' : [
-    files(
-      'mist_out.cpp',
-      'output.cpp',
-      'output_http.cpp',
-      'output_http_internal.cpp',
-    ),
-    io_cpp,
-    header_tgts,
-    embed_tgts,
-  ],
-  'link' : libmist,
-  'defines' :[
-    string_opt.format('OUTPUTTYPE', 'output_http_internal.h')
-  ],
-  'deps' : []
-}
