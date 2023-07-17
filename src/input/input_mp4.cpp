@@ -112,13 +112,13 @@ namespace Mist{
     capa["source_match"].append("https://*.mp4");
     capa["source_match"].append("s3+http://*.mp4");
     capa["source_match"].append("s3+https://*.mp4");
-    capa["source_match"].append("mp4:*");
     capa["source_file"] = "$source";
     capa["priority"] = 9;
     capa["codecs"]["video"].append("HEVC");
     capa["codecs"]["video"].append("H264");
     capa["codecs"]["video"].append("H263");
     capa["codecs"]["video"].append("VP6");
+    capa["codecs"]["video"].append("AV1");
     capa["codecs"]["audio"].append("AAC");
     capa["codecs"]["audio"].append("AC3");
     capa["codecs"]["audio"].append("MP3");
@@ -147,9 +147,7 @@ namespace Mist{
 
   bool inputMP4::preRun(){
     // open File
-    std::string inUrl = config->getString("input");
-    if (inUrl.size() > 4 && inUrl.substr(0, 4) == "mp4:"){inUrl.erase(0, 4);}
-    inFile.open(inUrl);
+    inFile.open(config->getString("input"));
     if (!inFile){return false;}
     if (!inFile.isSeekable()){
       FAIL_MSG("MP4 input only supports seekable data sources, for now, and this source is not seekable: %s", config->getString("input").c_str());
@@ -159,6 +157,14 @@ namespace Mist{
   }
 
   void inputMP4::dataCallback(const char *ptr, size_t size){readBuffer.append(ptr, size);}
+  size_t inputMP4::getDataCallbackPos() const{return readPos + readBuffer.size();}
+
+  bool inputMP4::needHeader(){
+    //Attempt to read cache, but force calling of the readHeader function anyway
+    bool r = Input::needHeader();
+    if (!r){r = !readHeader();}
+    return r;
+  }
 
   bool inputMP4::readHeader(){
     if (!inFile){
@@ -221,14 +227,13 @@ namespace Mist{
     }
 
 
-    // See whether a separate header file exists.
-    if (readExistingHeader()){
+    // If we already read a cached header, we can exit here.
+    if (M){
       bps = 0;
       std::set<size_t> tracks = M.getValidTracks();
       for (std::set<size_t>::iterator it = tracks.begin(); it != tracks.end(); it++){bps += M.getBps(*it);}
       return true;
     }
-    INFO_MSG("Not reading existing header");
 
     meta.reInit(isSingular() ? streamName : "");
     tNumber = 0;
@@ -253,7 +258,7 @@ namespace Mist{
       MP4::Box sEntryBox = stsdBox.getEntry(0);
       std::string sType = sEntryBox.getType();
 
-      if (!(sType == "avc1" || sType == "h264" || sType == "mp4v" || sType == "hev1" || sType == "hvc1" || sType == "mp4a" || sType == "aac " || sType == "ac-3" || sType == "tx3g")){
+      if (!(sType == "avc1" || sType == "h264" || sType == "mp4v" || sType == "hev1" || sType == "hvc1" || sType == "mp4a" || sType == "aac " || sType == "ac-3" || sType == "tx3g" || sType == "av01")){
         INFO_MSG("Unsupported track type: %s", sType.c_str());
         continue;
       }
@@ -313,6 +318,23 @@ namespace Mist{
         }
         initBox = vEntryBox.getPASP();
         if (initBox.isType("hvcC")){
+          meta.setInit(tNumber, initBox.payload(), initBox.payloadSize());
+        }
+      }
+      if (sType == "av01"){
+        MP4::VisualSampleEntry &vEntryBox = (MP4::VisualSampleEntry &)sEntryBox;
+        meta.setType(tNumber, "video");
+        meta.setCodec(tNumber, "AV1");
+        if (!meta.getWidth(tNumber)){
+          meta.setWidth(tNumber, vEntryBox.getWidth());
+          meta.setHeight(tNumber, vEntryBox.getHeight());
+        }
+        MP4::Box initBox = vEntryBox.getCLAP();
+        if (initBox.isType("av1C")){
+          meta.setInit(tNumber, initBox.payload(), initBox.payloadSize());
+        }
+        initBox = vEntryBox.getPASP();
+        if (initBox.isType("av1C")){
           meta.setInit(tNumber, initBox.payload(), initBox.payloadSize());
         }
       }
@@ -459,14 +481,6 @@ namespace Mist{
       }
     }
 
-    // outputting dtsh file
-    std::string inUrl = config->getString("input");
-    if (inUrl.size() > 4 && inUrl.substr(0, 4) == "mp4:"){inUrl.erase(0, 4);}
-    if (inUrl != "-" && HTTP::URL(inUrl).isLocalPath()){
-      M.toFile(inUrl + ".dtsh");
-    }else{
-      INFO_MSG("Skipping header write, as the source is not a local file");
-    }
     bps = 0;
     std::set<size_t> tracks = M.getValidTracks();
     for (std::set<size_t>::iterator it = tracks.begin(); it != tracks.end(); it++){bps += M.getBps(*it);}

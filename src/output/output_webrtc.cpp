@@ -51,6 +51,7 @@ namespace Mist{
   /* ------------------------------------------------ */
 
   OutWebRTC::OutWebRTC(Socket::Connection &myConn) : HTTPOutput(myConn){
+    noSignalling = false;
     totalPkts = 0;
     totalLoss = 0;
     totalRetrans = 0;
@@ -301,6 +302,147 @@ namespace Mist{
       RTP::PACKET_DROP_TIMEOUT = config->getInteger("losttimeout");
       INFO_MSG("Using regular RTP configuration: NACK at %u, drop at %u", RTP::PACKET_REORDER_WAIT, RTP::PACKET_DROP_TIMEOUT);
     }
+  }
+
+  void OutWebRTC::requestHandler(){
+    if (noSignalling){
+      if (!parseData){udp.sendPaced(10000);}
+      //After 10s of no packets, abort
+      if (Util::bootMS() > lastRecv + 10000){
+        Util::logExitReason("received no data for 10+ seconds");
+        config->is_active = false;
+      }
+      return;
+    }
+    HTTPOutput::requestHandler();
+  }
+
+  void OutWebRTC::respondHTTP(const HTTP::Parser & req, bool headersOnly){
+    // Check for WHIP payload
+    if (req.method == "OPTIONS"){
+      H.setCORSHeaders();
+      H.StartResponse("200", "All good", req, myConn);
+      H.Chunkify(0, 0, myConn);
+    }
+    if (req.method == "POST"){
+      if (req.GetHeader("Content-Type") == "application/sdp"){
+        SDP::Session sdpParser;
+        const std::string &offerStr = req.body;
+        if (packetLog.is_open()){
+          packetLog << "[" << Util::bootMS() << "]" << offerStr << std::endl << std::endl;
+        }
+        if (!sdpParser.parseSDP(offerStr) || !sdpAnswer.parseOffer(offerStr)){
+          H.setCORSHeaders();
+          H.StartResponse("400", "Could not parse", req, myConn);
+          H.Chunkify("Failed to parse offer SDP", myConn);
+          H.Chunkify(0, 0, myConn);
+          return;
+        }
+
+        bool ret = false;
+        if (sdpParser.hasSendOnlyMedia()){
+          ret = handleSignalingCommandRemoteOfferForInput(sdpParser);
+        }else{
+          ret = handleSignalingCommandRemoteOfferForOutput(sdpParser);
+        }
+        if (ret){
+          noSignalling = true;
+          H.SetHeader("Content-Type", "application/sdp");
+          H.SetHeader("Location", streamName + "/" + JSON::Value(getpid()).asString());
+          if (config->getString("iceservers").size()){
+            std::deque<std::string> links;
+            JSON::Value iceConf = JSON::fromString(config->getString("iceservers"));
+            jsonForEach(iceConf, i){
+              if (i->isMember("url") && (*i)["url"].isString()){
+                JSON::Value &u = (*i)["url"];
+                std::string str = u.asString()+"; rel=\"ice-server\";";
+                if (i->isMember("username")){
+                  str += " username=" + (*i)["username"].toString() + ";";
+                }
+                if (i->isMember("credential")){
+                  str += " credential=" + (*i)["credential"].toString() + ";";
+                }
+                if (i->isMember("credentialType")){
+                  str += " credential-type=" + (*i)["credentialType"].toString() + ";";
+                }
+                links.push_back(str);
+              }
+              if (i->isMember("urls") && (*i)["urls"].isString()){
+                JSON::Value &u = (*i)["urls"];
+                std::string str = u.asString()+"; rel=\"ice-server\";";
+                if (i->isMember("username")){
+                  str += " username=" + (*i)["username"].toString() + ";";
+                }
+                if (i->isMember("credential")){
+                  str += " credential=" + (*i)["credential"].toString() + ";";
+                }
+                if (i->isMember("credentialType")){
+                  str += " credential-type=" + (*i)["credentialType"].toString() + ";";
+                }
+                links.push_back(str);
+              }
+              if (i->isMember("urls") && (*i)["urls"].isArray()){
+                jsonForEach((*i)["urls"], j){
+                  JSON::Value &u = *j;
+                  std::string str = u.asString()+"; rel=\"ice-server\";";
+                  if (i->isMember("username")){
+                    str += " username=" + (*i)["username"].toString() + ";";
+                  }
+                  if (i->isMember("credential")){
+                    str += " credential=" + (*i)["credential"].toString() + ";";
+                  }
+                  if (i->isMember("credentialType")){
+                    str += " credential-type=" + (*i)["credentialType"].toString() + ";";
+                  }
+                  links.push_back(str);
+                }
+              }
+            }
+            if (links.size()){
+              if (links.size() == 1){
+                H.SetHeader("Link", *links.begin());
+              }else{
+                std::deque<std::string>::iterator it = links.begin();
+                std::string linkHeader = *it;
+                ++it;
+                while (it != links.end()){
+                  linkHeader += "\r\nLink: " + *it;
+                  ++it;
+                }
+                H.SetHeader("Link", linkHeader);
+              }
+            }
+          }
+          H.setCORSHeaders();
+          H.StartResponse("201", "Created", req, myConn);
+          H.Chunkify(sdpAnswer.toString(), myConn);
+          H.Chunkify(0, 0, myConn);
+          myConn.close();
+          return;
+        }else{
+          H.setCORSHeaders();
+          H.StartResponse("403", "Not allowed", req, myConn);
+          H.Chunkify("Request not allowed", myConn);
+          H.Chunkify(0, 0, myConn);
+          return;
+        }
+      }
+    }
+
+    // We don't implement PATCH requests
+    if (req.method == "PATCH"){
+      H.setCORSHeaders();
+      H.StartResponse("405", "PATCH not supported", req, myConn);
+      H.Chunkify("This endpoint only supports WHIP/WHEP/WISH POST requests or WebSocket connections", myConn);
+      H.Chunkify(0, 0, myConn);
+      return;
+    }
+
+    //Generic response handler
+    H.setCORSHeaders();
+    H.StartResponse("405", "Must POST or use websocket", req, myConn);
+    H.Chunkify("This endpoint only supports WHIP/WHEP/WISH POST requests or WebSocket connections", myConn);
+    H.Chunkify(0, 0, myConn);
   }
 
   // This function is executed when we receive a signaling data.
@@ -604,11 +746,13 @@ namespace Mist{
   }
 
   bool OutWebRTC::dropPushTrack(uint32_t trackId, const std::string & dropReason){
-    JSON::Value commandResult;
-    commandResult["type"] = "on_track_drop";
-    commandResult["track"] = trackId;
-    commandResult["mediatype"] = M.getType(trackId);
-    webSock->sendFrame(commandResult.toString());
+    if (!noSignalling){
+      JSON::Value commandResult;
+      commandResult["type"] = "on_track_drop";
+      commandResult["track"] = trackId;
+      commandResult["mediatype"] = M.getType(trackId);
+      webSock->sendFrame(commandResult.toString());
+    }
     return Output::dropPushTrack(trackId, dropReason);
   }
 
@@ -692,7 +836,7 @@ namespace Mist{
     }
 
     // this is necessary so that we can get the remote IP when creating STUN replies.
-    udp.SetDestination("0.0.0.0", 4444);
+    udp.allocateDestination();
 
     // we set parseData to `true` to start the data flow. Is also
     // used to break out of our loop in `onHTTP()`.
@@ -940,9 +1084,9 @@ namespace Mist{
     sdpAnswer.setDirection("recvonly");
 
     // start our receive thread (handles STUN, DTLS, RTP input)
-    webRTCInputOutputThread = new tthread::thread(webRTCInputOutputThreadFunc, NULL);
     rtcpTimeoutInMillis = Util::bootMS() + 2000;
     rtcpKeyFrameTimeoutInMillis = Util::bootMS() + 2000;
+    webRTCInputOutputThread = new tthread::thread(webRTCInputOutputThreadFunc, NULL);
 
     idleInterval = 1000;
 
@@ -1009,9 +1153,9 @@ namespace Mist{
   // function. The `webRTCInputOutputThreadFunc()` is basically empty
   // and all work for the thread is done here.
   void OutWebRTC::handleWebRTCInputOutputFromThread(){
-    udp.SetDestination("0.0.0.0", 4444);
+    udp.allocateDestination();
     while (keepGoing()){
-      if (!handleWebRTCInputOutput()){Util::sleep(20);}
+      if (!handleWebRTCInputOutput()){udp.sendPaced(10);}
     }
   }
 
@@ -1147,7 +1291,7 @@ namespace Mist{
     stun_writer.writeFingerprint();
     stun_writer.end();
     
-    udp.SendNow((const char *)stun_writer.getBufferPtr(), stun_writer.getBufferSize());
+    udp.sendPaced((const char *)stun_writer.getBufferPtr(), stun_writer.getBufferSize());
     myConn.addUp(stun_writer.getBufferSize());
   }
 
@@ -1192,7 +1336,7 @@ namespace Mist{
       HIGH_MSG("Could not answer NACK for %" PRIu32 " #%" PRIu16 ": packet not buffered", pSSRC, seq);
       return;
     }
-    udp.SendNow(nb.getData(seq), nb.getSize(seq));
+    udp.sendPaced(nb.getData(seq), nb.getSize(seq));
     myConn.addUp(nb.getSize(seq));
     HIGH_MSG("Answered NACK for %" PRIu32 " #%" PRIu16, pSSRC, seq);
   }
@@ -1228,9 +1372,9 @@ namespace Mist{
       int len = udp.data.size();
       if (srtpReader.unprotectRtp((uint8_t *)(char*)udp.data, &len) != 0){
         if (packetLog.is_open()){packetLog << "[" << Util::bootMS() << "]" << "RTP decrypt failure" << std::endl;}
-        FAIL_MSG("Failed to unprotect a RTP packet.");
         return;
       }
+      if (!len){return;}
       lastRecv = Util::bootMS();
       RTP::Packet unprotPack(udp.data, len);
       DONTEVEN_MSG("%s", unprotPack.toString().c_str());
@@ -1262,9 +1406,9 @@ namespace Mist{
       if (doDTLS){
         if (srtpReader.unprotectRtcp((uint8_t *)(char*)udp.data, &len) != 0){
           if (packetLog.is_open()){packetLog << "[" << Util::bootMS() << "]" << "RTCP decrypt failure" << std::endl;}
-          FAIL_MSG("Failed to unprotect RTCP.");
           return;
         }
+        if (!len){return;}
       }
 
       lastRecv = Util::bootMS();
@@ -1380,7 +1524,7 @@ namespace Mist{
   /* ------------------------------------------------ */
 
   int OutWebRTC::onDTLSHandshakeWantsToWrite(const uint8_t *data, int *nbytes){
-    udp.SendNow((const char *)data, (size_t)*nbytes);
+    udp.sendPaced((const char *)data, (size_t)*nbytes);
     myConn.addUp(*nbytes);
     return 0;
   }
@@ -1475,7 +1619,7 @@ namespace Mist{
         return;
       }
     }
-    udp.SendNow(rtpOutBuffer, (size_t)protectedSize);
+    udp.sendPaced(rtpOutBuffer, (size_t)protectedSize);
 
     RTP::Packet tmpPkt(rtpOutBuffer, protectedSize);
     uint32_t pSSRC = tmpPkt.getSSRC();
@@ -1514,7 +1658,7 @@ namespace Mist{
       }
     }
     
-    udp.SendNow(rtpOutBuffer, rtcpPacketSize);
+    udp.sendPaced(rtpOutBuffer, rtcpPacketSize);
     myConn.addUp(rtcpPacketSize);
 
     if (volkswagenMode){
@@ -1537,7 +1681,7 @@ namespace Mist{
     // first make sure that we complete the DTLS handshake.
     if(doDTLS){
       while (keepGoing() && !dtlsHandshake.hasKeyingMaterial()){
-        if (!handleWebRTCInputOutput()){Util::sleep(10);}
+        if (!handleWebRTCInputOutput()){udp.sendPaced(10000);}
         if (lastRecv < Util::bootMS() - 10000){
           WARN_MSG("Killing idle connection in handshake phase");
           onFail("idle connection in handshake phase", false);
@@ -1568,8 +1712,8 @@ namespace Mist{
       onIdle();
     }
 
-    if (M.getLive() && stayLive && lastTimeSync + 666 < thisPacket.getTime()){
-      lastTimeSync = thisPacket.getTime();
+    if (M.getLive() && stayLive && lastTimeSync + 666 < thisTime){
+      lastTimeSync = thisTime;
       if (liveSeek()){return;}
     }
 
@@ -1616,9 +1760,9 @@ namespace Mist{
     // This checks if we have a whole integer multiplier, and if so,
     // ensures only integer math is used to prevent rounding errors
     if (mult == (uint64_t)mult){
-      rtcTrack.rtpPacketizer.setTimestamp(thisPacket.getTime() * (uint64_t)mult);
+      rtcTrack.rtpPacketizer.setTimestamp(thisTime * (uint64_t)mult);
     }else{
-      rtcTrack.rtpPacketizer.setTimestamp(thisPacket.getTime() * mult);
+      rtcTrack.rtpPacketizer.setTimestamp(thisTime * mult);
     }
 
     bool isKeyFrame = thisPacket.getFlag("keyframe");
@@ -1654,7 +1798,7 @@ namespace Mist{
     //If this track hasn't sent yet, actually sent
     if (mustSendSR.count(thisIdx)){
       mustSendSR.erase(thisIdx);
-      rtcTrack.rtpPacketizer.sendRTCP_SR((void *)&udp, onRTPPacketizerHasRTCPDataCallback);
+      rtcTrack.rtpPacketizer.sendRTCP_SR((void *)&udp, 0, onRTPPacketizerHasRTCPDataCallback);
     }
   }
 
@@ -1757,7 +1901,7 @@ namespace Mist{
       }
     }
     
-    udp.SendNow((const char *)&buffer[0], buffer_size_in_bytes);
+    udp.sendPaced((const char *)&buffer[0], buffer_size_in_bytes);
     myConn.addUp(buffer_size_in_bytes);
 
     if (volkswagenMode){
@@ -1798,7 +1942,7 @@ namespace Mist{
       }
     }
 
-    udp.SendNow((const char *)&buffer[0], buffer_size_in_bytes);
+    udp.sendPaced((const char *)&buffer[0], buffer_size_in_bytes);
     myConn.addUp(buffer_size_in_bytes);
 
     if (volkswagenMode){
@@ -1849,7 +1993,7 @@ namespace Mist{
       }
     }
     
-    udp.SendNow((const char *)&buffer[0], buffer_size_in_bytes);
+    udp.sendPaced((const char *)&buffer[0], buffer_size_in_bytes);
     myConn.addUp(buffer_size_in_bytes);
 
     if (volkswagenMode){
@@ -1903,7 +2047,7 @@ namespace Mist{
       //Do not reduce under 32 kbps
       if (videoConstraint < 1024*32){videoConstraint = 1024*32;}
 
-      if (videoConstraint != preConstraint){
+      if (!noSignalling && videoConstraint != preConstraint){
         INFO_MSG("Reduced video bandwidth maximum to %" PRIu32 " because average loss is %.2f", videoConstraint, curr_avg_loss);
         JSON::Value commandResult;
         commandResult["type"] = "on_video_bitrate";

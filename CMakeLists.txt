@@ -186,6 +186,7 @@ set(libHeaders
   lib/dtls_srtp_handshake.h
   lib/dtsc.h
   lib/encryption.h
+  lib/flac.h
   lib/flv_tag.h
   lib/h264.h
   lib/h265.h
@@ -253,6 +254,7 @@ add_library (mist
   lib/dtls_srtp_handshake.cpp
   lib/dtsc.cpp
   lib/encryption.cpp
+  lib/flac.cpp
   lib/flv_tag.cpp
   lib/h264.cpp
   lib/h265.cpp
@@ -386,6 +388,7 @@ makeAnalyser(H264 h264) #LTS
 makeAnalyser(HLS hls) #LTS
 makeAnalyser(RIFF riff) #LTS
 makeAnalyser(RTSP rtsp) #LTS
+makeAnalyser(FLAC flac)
 
 #LTS_START
 ########################################
@@ -462,6 +465,8 @@ makeInput(HLS hls)
 makeInput(DTSC dtsc)
 makeInput(MP3 mp3)
 makeInput(FLV flv)
+makeInput(FLAC flac)
+
 option(WITH_AV "Build a generic libav-based input (not distributable!)")
 if (WITH_AV)
   makeInput(AV av)
@@ -478,7 +483,7 @@ makeInput(Folder folder)#LTS
 makeInput(Playlist playlist)#LTS
 makeInput(Balancer balancer)#LTS
 makeInput(RTSP rtsp)#LTS
-makeInput(SRT srt)#LTS
+makeInput(SubRip srt)#LTS
 makeInput(SDP sdp)
 
 if(SRT_LIB)
@@ -554,7 +559,7 @@ makeOutput(AAC aac             http)
 makeOutput(MP3 mp3             http)
 makeOutput(H264 h264           http)
 makeOutput(HDS hds             http)
-makeOutput(SRT srt             http)
+makeOutput(SubRip srt             http)
 makeOutput(JSON json           http)
 option(WITH_JPG "Build JPG thumbnailer output support")
 if (WITH_JPG)
@@ -574,6 +579,7 @@ makeOutput(EBML ebml)
 makeOutput(RTSP rtsp)#LTS
 makeOutput(WAV wav)#LTS
 makeOutput(SDP sdp             http)
+makeOutput(FLAC flac           http)
 
 add_executable(MistSession
   ${BINARY_DIR}/mist/.headers
@@ -845,6 +851,7 @@ add_custom_command(OUTPUT generated/server.html.h
 # MistController - Build               #
 ########################################
 add_executable(MistController
+  src/controller/controller_external_writers.h
   src/controller/controller_limits.h
   src/controller/controller_uplink.h
   src/controller/controller_api.h
@@ -855,7 +862,9 @@ add_executable(MistController
   src/controller/controller_capabilities.h
   src/controller/controller_streams.h
   src/controller/controller_push.h
+  src/controller/controller_variables.h
   src/controller/controller.cpp
+  src/controller/controller_external_writers.cpp
   src/controller/controller_updater.cpp
   src/controller/controller_streams.cpp
   src/controller/controller_storage.cpp
@@ -866,6 +875,7 @@ add_executable(MistController
   src/controller/controller_uplink.cpp
   src/controller/controller_api.cpp
   src/controller/controller_push.cpp
+  src/controller/controller_variables.cpp
   generated/server.html.h
   ${BINARY_DIR}/mist/.headers
 )
@@ -904,6 +914,9 @@ add_test(URLTest COMMAND urltest)
 add_executable(logtest test/log.cpp ${BINARY_DIR}/mist/.headers)
 target_link_libraries(logtest mist)
 add_test(LOGTest COMMAND logtest)
+add_executable(logconvertertest test/converter.cpp ${BINARY_DIR}/mist/.headers)
+target_link_libraries(logconvertertest mist)
+add_test(LOGConverterTest COMMAND logconvertertest)
 add_executable(downloadertest test/downloader.cpp ${BINARY_DIR}/mist/.headers)
 target_link_libraries(downloadertest mist)
 add_test(DownloaderTest COMMAND downloadertest)

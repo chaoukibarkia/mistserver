@@ -65,13 +65,17 @@ namespace HTTP{
     return url;
   }
 
+  HTTP::URL localURIResolver(){
+    char workDir[512];
+    getcwd(workDir, 512);
+    return HTTP::URL(std::string("file://") + workDir + "/");
+  }
 
   void URIReader::init(){
     handle = -1;
     mapped = 0;
-    char workDir[512];
-    getcwd(workDir, 512);
-    myURI = HTTP::URL(std::string("file://") + workDir + "/");
+    myURI = localURIResolver();
+    originalUrl = myURI;
     cbProgress = 0;
     minLen = 1;
     maxLen = std::string::npos;
@@ -97,10 +101,24 @@ namespace HTTP{
     open(reluri);
   }
 
-  bool URIReader::open(const std::string &reluri){return open(myURI.link(reluri));}
+  bool URIReader::open(const std::string &reluri){return open(originalUrl.link(reluri));}
 
   /// Internal callback function, used to buffer data.
   void URIReader::dataCallback(const char *ptr, size_t size){allData.append(ptr, size);}
+
+  size_t URIReader::getDataCallbackPos() const{return allData.size();}
+
+  bool URIReader::open(const int fd){
+    close();
+    myURI = HTTP::URL("file://-");
+    originalUrl = myURI;
+    downer.getSocket().open(-1, fd);
+    stateType = HTTP::Stream;
+    startPos = 0;
+    endPos = std::string::npos;
+    totalSize = std::string::npos;
+    return true;
+  }
 
   bool URIReader::open(const HTTP::URL &uri){
     close();
@@ -247,17 +265,26 @@ namespace HTTP{
 
     //HTTP-based needs to do a range request
     if (stateType == HTTP::HTTP && supportRangeRequest){
-      downer.getSocket().close();
-      downer.getSocket().Received().clear();
+      downer.clean();
+      curPos = pos;
       injectHeaders(originalUrl, "GET", downer);
-      if (!downer.getRangeNonBlocking(myURI.getUrl(), pos, 0)){
+      if (!downer.getRangeNonBlocking(myURI, pos, 0)){
         FAIL_MSG("Error making range request");
         return false;
       }
-      curPos = pos;
       return true;
     }
     return false;
+  }
+
+  std::string URIReader::getHost() const{
+    if (stateType == HTTP::File){return "";}
+    return downer.getSocket().getHost();
+  }
+
+  std::string URIReader::getBinHost() const{
+    if (stateType == HTTP::File){return std::string("\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000", 16);}
+    return downer.getSocket().getBinHost();
   }
 
   void URIReader::readAll(size_t (*dataCallback)(const char *data, size_t len)){
@@ -289,39 +316,37 @@ namespace HTTP{
   // readsome with callback
   void URIReader::readSome(size_t wantedLen, Util::DataCallback &cb){
     if (isEOF()){return;}
+    // Files read from the memory-mapped file
     if (stateType == HTTP::File){
-      //      dataPtr = mapped + curPos;
-      uint64_t dataLen = 0;
-
-      if (wantedLen < totalSize){
-        if ((wantedLen + curPos) > totalSize){
-          dataLen = totalSize - curPos; // restant
-          // INFO_MSG("file curpos: %llu, dataLen: %llu, totalSize: %llu ", curPos, dataLen, totalSize);
-        }else{
-          dataLen = wantedLen;
-        }
-      }else{
-        dataLen = totalSize;
-      }
-
-      std::string t = std::string(mapped + curPos, dataLen);
-      cb.dataCallback(t.c_str(), dataLen);
-
+      // Simple bounds check, don't read beyond the end of the file
+      uint64_t dataLen = ((wantedLen + curPos) > totalSize) ? totalSize - curPos : wantedLen;
+      cb.dataCallback(mapped + curPos, dataLen);
       curPos += dataLen;
-
-    }else if (stateType == HTTP::HTTP){
+      return;
+    }
+    // HTTP-based read from the Downloader
+    if (stateType == HTTP::HTTP){
+      // Note: this function returns true if the full read was completed only.
+      // It's the reason this function returns void rather than bool.
       downer.continueNonBlocking(cb);
-    }else{// streaming mode
-      int s;
-      if ((downer.getSocket() && downer.getSocket().spool())){// || downer.getSocket().Received().size() > 0){
+      return;
+    }
+    // Everything else uses the socket directly
+    int s = downer.getSocket().Received().bytes(wantedLen);
+    if (!s){
+      // Only attempt to read more if nothing was in the buffer
+      if (downer.getSocket() && downer.getSocket().spool()){
         s = downer.getSocket().Received().bytes(wantedLen);
-        std::string buf = downer.getSocket().Received().remove(s);
-
-        cb.dataCallback(buf.data(), s);
       }else{
         Util::sleep(50);
+        return;
       }
     }
+    // Future optimization: augment the Socket::Buffer to handle a Util::DataCallback as argument.
+    // Would remove the need for this extra copy here.
+    Util::ResizeablePointer buf;
+    downer.getSocket().Received().remove(buf, s);
+    cb.dataCallback(buf, s);
   }
 
   /// Readsome blocking function.
@@ -354,9 +379,7 @@ namespace HTTP{
     allData.truncate(0);
     bufPos = 0;
     // Close downloader socket if open
-    downer.getSocket().close();
-    downer.getSocket().Received().clear();
-    downer.getHTTP().Clean();
+    downer.clean();
     // Unmap file if mapped
     if (mapped){
       munmap(mapped, totalSize);
@@ -408,7 +431,7 @@ namespace HTTP{
 
   uint64_t URIReader::getPos(){return curPos;}
 
-  const HTTP::URL &URIReader::getURI() const{return myURI;}
+  const HTTP::URL &URIReader::getURI() const{return originalUrl;}
 
   size_t URIReader::getSize() const{return totalSize;}
 

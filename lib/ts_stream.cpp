@@ -15,26 +15,42 @@ tthread::recursive_mutex tMutex;
 
 namespace TS{
 
-  bool Assembler::assemble(Stream & TSStrm, char * ptr, size_t len, bool parse){
+  Assembler::Assembler(){
+    isLive = false;
+  }
+
+  void Assembler::setLive(bool live){
+    isLive = live;
+  }
+
+  bool Assembler::assemble(Stream & TSStrm, const char * ptr, size_t len, bool parse, uint64_t bytePos){
     bool ret = false;
     size_t offset = 0;
     size_t amount = 188-leftData.size();
-    if (leftData.size() && len >= amount){
-      //Attempt to re-assemble a packet from the leftovers of last time + current head
-      if (len == amount || ptr[amount] == 0x47){
-        VERYHIGH_MSG("Assembled scrap packet");
-        //Success!
-        leftData.append(ptr, amount);
-        tsBuf.FromPointer(leftData);
-        if (!ret && tsBuf.getUnitStart()){ret = true;}
-        if (parse){
-          TSStrm.parse(tsBuf, 0);
-        }else{
-          TSStrm.add(tsBuf);
-          if (!TSStrm.isDataTrack(tsBuf.getPID())){TSStrm.parse(tsBuf.getPID());}
+    if (leftData.size()){
+      if (len >= amount){
+        //Attempt to re-assemble a packet from the leftovers of last time + current head
+        if (len == amount || ptr[amount] == 0x47){
+          VERYHIGH_MSG("Assembled scrap packet");
+          //Success!
+          bytePos -= leftData.size();
+          leftData.append(ptr, amount);
+          tsBuf.FromPointer(leftData);
+          if (!ret && tsBuf.getUnitStart()){ret = true;}
+          if (parse){
+            TSStrm.parse(tsBuf, isLive?0:bytePos);
+          }else{
+            TSStrm.add(tsBuf);
+            if (!TSStrm.isDataTrack(tsBuf.getPID())){TSStrm.parse(tsBuf.getPID());}
+          }
+          offset = amount;
+          bytePos += 188;
+          leftData.truncate(0);
         }
-        offset = amount;
-        leftData.assign(0,0);
+      }else{
+        //No way to verify, we'll just append and hope for the best...
+        leftData.append(ptr, len);
+        return ret;
       }
       //On failure, hope we might live to succeed another day
     }
@@ -51,7 +67,7 @@ namespace TS{
           tsBuf.FromPointer(ptr + offset);
           if (!ret && tsBuf.getUnitStart()){ret = true;}
           if (parse){
-            TSStrm.parse(tsBuf, 0);
+            TSStrm.parse(tsBuf, isLive?0:bytePos);
           }else{
             TSStrm.add(tsBuf);
             if (!TSStrm.isDataTrack(tsBuf.getPID())){TSStrm.parse(tsBuf.getPID());}
@@ -59,13 +75,19 @@ namespace TS{
         }else{
           leftData.assign(ptr + offset, len - offset);
         }
+        bytePos += 188;
         offset += 188;
       }else{
         ++junk;
         ++offset;
+        ++bytePos;
       }
     }
     return ret;
+  }
+
+  void Assembler::clear(){
+    leftData.truncate(0);
   }
 
   void ADTSRemainder::setRemainder(const aac::adts &p, const void *source, uint32_t avail, uint64_t bPos){
@@ -1135,6 +1157,13 @@ namespace TS{
         }
       }
       MEDIUM_MSG("Initialized track %zu as %s %s", idx, codec.c_str(), type.c_str());
+      if (tid != INVALID_TRACK_ID){return;}
+    }
+    if (tid != INVALID_TRACK_ID){
+      WARN_MSG("Could not init track %zu!", tid);
+      for (std::map<size_t, uint32_t>::const_iterator it = pidToCodec.begin(); it != pidToCodec.end(); it++){
+        INFO_MSG("Track %zu (%" PRIu32 ") no match", it->first, it->second);
+      }
     }
   }
 

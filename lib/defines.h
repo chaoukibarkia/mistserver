@@ -204,13 +204,19 @@ static inline void show_stackframe(){}
 #define COMMS_SESSIONS "MstSession%s"
 #define COMMS_SESSIONS_INITSIZE 8 * 1024 * 1024
 
+#define CUSTOM_VARIABLES_INITSIZE 64 * 1024
+
+#define EXTWRITERS "MstExtWriters"
+
+#define EXTWRITERS_INITSIZE 1 * 1024 * 1024
+
 #define SEM_STATISTICS "/MstStat"
 #define SEM_USERS "/MstUser%s" //%s stream name
 
 #define SHM_TRACK_DATA "MstData%s@%zu_%" PRIu32 //%s stream name, %zu track ID, %PRIu32 page #
 // End new meta
 
-#define INPUT_USER_INTERVAL 1000
+#define INPUT_USER_INTERVAL 250
 
 #define SHM_STREAM_STATE "MstSTATE%s" //%s stream name
 #define SHM_STREAM_CONF "MstSCnf%s"   //%s stream name
@@ -238,6 +244,7 @@ static inline void show_stackframe(){}
 #define SHM_STATE_LOGS "MstStateLogs"
 #define SHM_STATE_ACCS "MstStateAccs"
 #define SHM_STATE_STREAMS "MstStateStreams"
+#define SHM_CUSTOM_VARIABLES "MstVars"
 #define NAME_BUFFER_SIZE 200 // char buffer size for snprintf'ing shm filenames
 #define SHM_SESSIONS "/MstSess"
 #define SHM_SESSIONS_ITEM 165     // 4 byte crc, 100b streamname, 20b connector, 40b host, 1b sync
@@ -278,3 +285,20 @@ static inline void show_stackframe(){}
 
 #define NEW_TRACK_ID 0x80000000
 #define QUICK_NEGOTIATE 0xC0000000
+
+// Session and Comm library related constants
+#define COMM_STATUS_SOURCE 0x80
+#define COMM_STATUS_DONOTTRACK 0x40
+#define COMM_STATUS_DISCONNECT 0x20
+#define COMM_STATUS_REQDISCONNECT 0x10
+#define COMM_STATUS_ACTIVE 0x1
+#define COMM_STATUS_INVALID 0x0
+#define SESS_BUNDLE_DEFAULT_VIEWER 14
+#define SESS_BUNDLE_DEFAULT_OTHER 15
+#define SESS_DEFAULT_STREAM_INFO_MODE 1
+#define SESS_HTTP_AS_VIEWER 1
+#define SESS_HTTP_AS_OUTPUT 2
+#define SESS_HTTP_DISABLED 3
+#define SESS_HTTP_AS_UNSPECIFIED 4
+#define SESS_TKN_DEFAULT_MODE 15
+

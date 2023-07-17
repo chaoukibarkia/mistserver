@@ -100,12 +100,27 @@ static uint64_t ISO8601toUnixmillis(const std::string &ts){
 }
 
 namespace Mist{
-  // Save playlist objects for manual reloading
+  /// Save playlist objects for manual reloading
   static std::map<uint64_t, Playlist> playlistMapping;
-  // Track which segment numbers have been parsed
+
+  /// Local RAM buffer for recently accessed segments
+  std::map<std::string, Util::ResizeablePointer> segBufs;
+
+  /// Order of adding/accessing for local RAM buffer of segments
+  std::deque<std::string> segBufAccs;
+
+  /// Order of adding/accessing sizes for local RAM buffer of segments
+  std::deque<size_t> segBufSize;
+
+  size_t segBufTotalSize = 0;
+
+  /// Track which segment numbers have been parsed
   std::map<uint64_t, uint64_t> parsedSegments;
+
   /// Mutex for accesses to listEntries
   tthread::mutex entryMutex;
+
+  JSON::Value playlist_urls; ///< Relative URLs to the various playlists
 
   static unsigned int plsTotalCount = 0; /// Total playlists active
   static unsigned int plsInitCount = 0;  /// Count of playlists fully inited
@@ -167,11 +182,18 @@ namespace Mist{
     MEDIUM_MSG("Downloader thread for '%s' exiting", pls.uri.c_str());
   }
 
-  Playlist::Playlist(const std::string &uriSrc){
+  Playlist::Playlist(const std::string &uriSource){
     nextUTC = 0;
     id = 0; // to be set later
     //If this is the copy constructor, just be silent.
-    if (uriSrc.size()){INFO_MSG("Adding variant playlist: %s", uriSrc.c_str());}
+    std::string uriSrc;
+    if (uriSource.find('\n') != std::string::npos){
+      uriSrc = uriSource.substr(0, uriSource.find('\n'));
+      relurl = uriSource.substr(uriSource.find('\n') + 1);
+    }else{
+      uriSrc = uriSource;
+    }
+    if (uriSrc.size()){INFO_MSG("Adding variant playlist: %s -> %s", relurl.c_str(), uriSrc.c_str());}
     lastFileIndex = 0;
     waitTime = 2;
     playlistEnd = false;
@@ -224,12 +246,15 @@ namespace Mist{
     isOpen = false;
     segDL.onProgress(callbackFunc);
     encrypted = false;
+    currBuf = 0;
+    packetPtr = 0;
   }
 
   /// Returns true if packetPtr is at the end of the current segment.
   bool SegmentDownloader::atEnd() const{
-    if (!isOpen){return true;}
-    return segDL.isEOF();
+    if (!isOpen || !currBuf){return true;}
+    if (buffered){return currBuf->size() <= offset + 188;}
+    return !segDL && currBuf->size() <= offset + 188;
     // return (packetPtr - segDL.const_data().data() + 188) > segDL.const_data().size();
   }
 
@@ -294,15 +319,65 @@ namespace Mist{
       return false;
     }else{
       // Plaintext
-      size_t len = 0;
-      segDL.readSome(packetPtr, len, 188);
-      if (len != 188 || packetPtr[0] != 0x47){
-        FAIL_MSG("Not a valid TS packet: len %zu, first byte %" PRIu8, len, (uint8_t)packetPtr[0]);
+      if (buffered){
+        if (atEnd()){return false;}
+      }else{
+        if (!currBuf){return false;}
+        size_t retries = 0;
+        while (segDL && currBuf->size() < offset + 188 + 188){
+          size_t preSize = currBuf->size();
+          segDL.readSome(offset + 188 + 188 - currBuf->size(), *this);
+          if (currBuf->size() < offset + 188 + 188){
+            if (!segDL){
+              if (!segDL.isSeekable()){return false;}
+              // Only retry/resume if seekable and allocated size greater than current size
+              if (currBuf->rsize() > currBuf->size()){
+                // Seek to current position to resume
+                ++retries;
+                if (retries > 5){
+                  segDL.close();
+                  return false;
+                }
+                segDL.seek(currBuf->size());
+              }
+            }
+            if (currBuf->size() <= preSize){
+              Util::sleep(5);
+            }
+          }
+        }
+        if (currBuf->size() < offset + 188 + 188){return false;}
+      }
+      // First packet is at offset 0, not 188. Skip increment for this one.
+      if (!firstPacket){
+        offset += 188;
+      }else{
+        firstPacket = false;
+      }
+      packetPtr = *currBuf + offset;
+      if (!packetPtr || packetPtr[0] != 0x47){
+        std::stringstream packData;
+        if (packetPtr){
+          for (uint64_t i = 0; i < 188; ++i){
+            packData << std::hex << std::setw(2) << std::setfill('0') << (unsigned int)packetPtr[i];
+          }
+        }
+        FAIL_MSG("Not a valid TS packet: byte %zu is not 0x47: %s", offset, packData.str().c_str());
         return false;
       }
       return true;
     }
   }
+
+  void SegmentDownloader::dataCallback(const char *ptr, size_t size){
+    currBuf->append(ptr, size);
+    //Overwrite the current segment size
+    segBufTotalSize -= segBufSize.front();
+    segBufSize.front() = currBuf->size();
+    segBufTotalSize += segBufSize.front();
+  }
+
+  size_t SegmentDownloader::getDataCallbackPos() const{return currBuf->size();}
 
   /// Attempts to read a single TS packet from the current segment, setting packetPtr on success
   void SegmentDownloader::close(){
@@ -318,12 +393,59 @@ namespace Mist{
 
     MEDIUM_MSG("Loading segment: %s, key: %s, ivec: %s", entry.filename.c_str(), hexKey.c_str(),
                hexIvec.c_str());
-    if (!segDL.open(entry.filename)){
-      FAIL_MSG("Could not open %s", entry.filename.c_str());
-      return false;
-    }
 
-    if (!segDL){return false;}
+    offset = 0;
+    firstPacket = true;
+    buffered = segBufs.count(entry.filename);
+    if (!buffered){
+      HIGH_MSG("Reading non-cache: %s", entry.filename.c_str());
+      if (!segDL.open(entry.filename)){
+        FAIL_MSG("Could not open %s", entry.filename.c_str());
+        return false;
+      }
+      if (!segDL){return false;}
+      //Remove cache entries while above 16MiB in total size, unless we only have 1 entry (we keep two at least at all times)
+      while (segBufTotalSize > 16 * 1024 * 1024 && segBufs.size() > 1){
+        HIGH_MSG("Dropping from segment cache: %s", segBufAccs.back().c_str());
+        segBufs.erase(segBufAccs.back());
+        segBufTotalSize -= segBufSize.back();
+        segBufAccs.pop_back();
+        segBufSize.pop_back();
+      }
+      segBufAccs.push_front(entry.filename);
+      segBufSize.push_front(0);
+      currBuf = &(segBufs[entry.filename]);
+    }else{
+      HIGH_MSG("Reading from segment cache: %s", entry.filename.c_str());
+      currBuf = &(segBufs[entry.filename]);
+      if (currBuf->rsize() != currBuf->size()){
+        MEDIUM_MSG("Cache was incomplete (%zu/%" PRIu32 "), resuming", currBuf->size(), currBuf->rsize());
+        buffered = false;
+        // We only re-open and seek if the opened URL doesn't match what we want already
+        HTTP::URL A = segDL.getURI();
+        HTTP::URL B = HTTP::localURIResolver().link(entry.filename);
+        if (A != B){
+          if (!segDL.open(entry.filename)){
+            FAIL_MSG("Could not open %s", entry.filename.c_str());
+            return false;
+          }
+          if (!segDL){return false;}
+          //Seek to current position in segment for resuming
+          currBuf->truncate(currBuf->size() / 188 * 188);
+          MEDIUM_MSG("Seeking to %zu", currBuf->size());
+          segDL.seek(currBuf->size());
+        }
+      }
+    }
+    if (!buffered){
+      // Allocate full size if known
+      if (segDL.getSize() != std::string::npos){currBuf->allocate(segDL.getSize());}
+      // Download full segment if not seekable, pretend it was cached all along
+      if (!segDL.isSeekable()){
+        segDL.readAll(*this);
+        buffered = true;
+      }
+    }
 
     encrypted = false;
     outData.truncate(0);
@@ -473,7 +595,6 @@ namespace Mist{
       DONTEVEN_MSG("Current file has index #%" PRIu64 ", last index was #%" PRIu64 "", fileNo, lastFileIndex);
       if (fileNo >= lastFileIndex){
         cleanLine(filename);
-        filename = root.link(filename).getUrl();
         char ivec[16];
         if (keyIV.size()){
           parseKey(keyIV, ivec, 16);
@@ -481,7 +602,7 @@ namespace Mist{
           memset(ivec, 0, 16);
           Bit::htobll(ivec + 8, fileNo);
         }
-        addEntry(filename, f, totalBytes, keys[keyUri], std::string(ivec, 16));
+        addEntry(root.link(filename).getUrl(), filename, f, totalBytes, keys[keyUri], std::string(ivec, 16));
         lastFileIndex = fileNo + 1;
         ++count;
       }
@@ -519,7 +640,7 @@ namespace Mist{
   }
 
   /// Adds playlist segments to be processed
-  void Playlist::addEntry(const std::string &filename, float duration, uint64_t &totalBytes,
+  void Playlist::addEntry(const std::string &absolute_filename, const std::string &filename, float duration, uint64_t &totalBytes,
                           const std::string &key, const std::string &iv){
     // if (!isSupportedFile(filename)){
     //  WARN_MSG("Ignoring unsupported file: %s", filename.c_str());
@@ -527,7 +648,8 @@ namespace Mist{
     //}
 
     playListEntries entry;
-    entry.filename = filename;
+    entry.filename = absolute_filename;
+    entry.relative_filename = filename;
     cleanLine(entry.filename);
     entry.bytePos = totalBytes;
     entry.duration = duration;
@@ -558,6 +680,7 @@ namespace Mist{
       // The mutex assures we have a unique count/number.
       if (!id){id = listEntries.size() + 1;}
       HIGH_MSG("Adding entry '%s' to ID %u", filename.c_str(), id);
+      playlist_urls[JSON::Value(id).asString()] = relurl;
       listEntries[id].push_back(entry);
     }
   }
@@ -718,18 +841,25 @@ namespace Mist{
       INFO_MSG("Header needs update as it contains no playlist entries, regenerating");
       return false;
     }
+    if (!M.inputLocalVars.isMember("playlist_urls")){
+      INFO_MSG("Header needs update as it contains no playlist URLs, regenerating");
+      return false;
+    }
     if (!M.inputLocalVars.isMember("pidMappingR")){
       INFO_MSG("Header needs update as it contains no packet id mappings, regenerating");
       return false;
     }
     // Recover playlist entries
     tthread::lock_guard<tthread::mutex> guard(entryMutex);
+    HTTP::URL root(config->getString("input"));
     jsonForEachConst(M.inputLocalVars["playlistEntries"], i){
+      uint64_t plNum = JSON::Value(i.key()).asInt();
       std::deque<playListEntries> newList;
       jsonForEachConst(*i, j){
         const JSON::Value & thisEntry = *j;
         playListEntries newEntry;
-        newEntry.filename = thisEntry[0u].asString();
+        newEntry.relative_filename = thisEntry[0u].asString();
+        newEntry.filename = root.link(M.inputLocalVars["playlist_urls"][i.key()]).link(thisEntry[0u].asString()).getUrl();
         newEntry.bytePos = thisEntry[1u].asInt();
         newEntry.mUTC = thisEntry[2u].asInt();
         newEntry.duration = thisEntry[3u].asDouble();
@@ -745,7 +875,7 @@ namespace Mist{
         }
         newList.push_back(newEntry);
       }
-      listEntries[JSON::Value(i.key()).asInt()] = newList;
+      listEntries[plNum] = newList;
     }
     // Recover pidMappings
     jsonForEachConst(M.inputLocalVars["pidMappingR"], i){
@@ -763,7 +893,6 @@ namespace Mist{
 
   bool inputHLS::readHeader(){
     if (streamIsLive && !isLiveDVR){return true;}
-    if (readExistingHeader()){return true;}
     // to analyse and extract data
     TS::Packet packet; 
     char *data;
@@ -772,13 +901,21 @@ namespace Mist{
     meta.reInit(isSingular() ? streamName : "");
 
     tthread::lock_guard<tthread::mutex> guard(entryMutex);
+
+    size_t totalSegments = 0, currentSegment = 0;
     for (std::map<uint32_t, std::deque<playListEntries> >::iterator pListIt = listEntries.begin();
          pListIt != listEntries.end(); pListIt++){
+      totalSegments += pListIt->second.size();
+    }
+
+    for (std::map<uint32_t, std::deque<playListEntries> >::iterator pListIt = listEntries.begin();
+         pListIt != listEntries.end() && config->is_active; pListIt++){
       tsStream.clear();
       uint32_t entId = 0;
 
       for (std::deque<playListEntries>::iterator entryIt = pListIt->second.begin();
-           entryIt != pListIt->second.end(); entryIt++){
+           entryIt != pListIt->second.end() && config->is_active; entryIt++){
+        ++currentSegment;
         tsStream.partialClear();
 
         if (!segDowner.loadSegment(*entryIt)){
@@ -787,7 +924,7 @@ namespace Mist{
         }
         entId++;
         allowRemap = true;
-        while (!segDowner.atEnd()){
+        while ((!segDowner.atEnd() || tsStream.hasPacket()) && config->is_active){
           // Wait for packets on each track to make sure the offset is set based on the earliest packet
           hasPacket = tsStream.hasPacketOnEachTrack() || (segDowner.atEnd() && tsStream.hasPacket());
           if (hasPacket){
@@ -807,7 +944,7 @@ namespace Mist{
               // keyframe data exists, so always add 19 bytes keyframedata.
               uint32_t packOffset = headerPack.hasMember("offset") ? headerPack.getInt("offset") : 0;
               size_t packSendSize = 24 + (packOffset ? 17 : 0) + (entId >= 0 ? 15 : 0) + 19 + dataLen + 11;
-              VERYHIGH_MSG("Adding packet (%zuB) at %" PRIu64 " with an offset of %" PRIu32 " on track %zu", dataLen, packetTime, packOffset, idx);
+              DONTEVEN_MSG("Adding packet (%zuB) at %" PRIu64 " with an offset of %" PRIu32 " on track %zu", dataLen, packetTime, packOffset, idx);
               meta.update(packetTime, packOffset, idx, dataLen, entId, headerPack.hasMember("keyframe"), packSendSize);
               tsStream.getEarliestPacket(headerPack);
             }
@@ -823,7 +960,7 @@ namespace Mist{
         DTSC::Packet headerPack;
         tsStream.getEarliestPacket(headerPack);
         while (headerPack){
-          int tmpTrackId = headerPack.getTrackId();
+          size_t tmpTrackId = headerPack.getTrackId();
           uint64_t packetId = getPacketID(pListIt->first, tmpTrackId);
           uint64_t packetTime = getPacketTime(headerPack.getTime(), tmpTrackId, pListIt->first, entryIt->mUTC);
           size_t idx = M.trackIDToIndex(packetId, getpid());
@@ -836,7 +973,7 @@ namespace Mist{
           // keyframe data exists, so always add 19 bytes keyframedata.
           uint32_t packOffset = headerPack.hasMember("offset") ? headerPack.getInt("offset") : 0;
           size_t packSendSize = 24 + (packOffset ? 17 : 0) + (entId >= 0 ? 15 : 0) + 19 + dataLen + 11;
-          VERYHIGH_MSG("Adding packet (%zuB) at %" PRIu64 " with an offset of %" PRIu32 " on track %zu", dataLen, packetTime, packOffset, idx);
+          DONTEVEN_MSG("Adding packet (%zuB) at %" PRIu64 " with an offset of %" PRIu32 " on track %zu", dataLen, packetTime, packOffset, idx);
           meta.update(packetTime, packOffset, idx, dataLen, entId, headerPack.hasMember("keyframe"), packSendSize);
           tsStream.getEarliestPacket(headerPack);
         }
@@ -849,8 +986,14 @@ namespace Mist{
           std::deque<playListEntries> &curList = listEntries[pListIt->first];
           curList.at(entId-1).timeOffset = 0;
         }
+
+        //Set progress counter
+        if (streamStatus && streamStatus.len > 1){
+          streamStatus.mapped[1] = (255 * currentSegment) / totalSegments;
+        }
       }
     }
+    if (!config->is_active){return false;}
 
     // set bootMsOffset in order to display the program time correctly in the player
     if (meta.getLive()){meta.setUTCOffset(streamOffset + (Util::unixMS() - Util::bootMS()));}
@@ -868,7 +1011,7 @@ namespace Mist{
       for (std::deque<playListEntries>::iterator entryIt = pListIt->second.begin();
          entryIt != pListIt->second.end(); entryIt++){
         JSON::Value thisEntries;
-        thisEntries.append(entryIt->filename);
+        thisEntries.append(entryIt->relative_filename);
         thisEntries.append(entryIt->bytePos);
         thisEntries.append(entryIt->mUTC);
         thisEntries.append(entryIt->duration);
@@ -881,6 +1024,7 @@ namespace Mist{
       }
       allEntries[JSON::Value(pListIt->first).asString()] = thisPlaylist;
     }
+    meta.inputLocalVars["playlist_urls"] = playlist_urls;
     meta.inputLocalVars["playlistEntries"] = allEntries;
     meta.inputLocalVars["streamoffset"] = streamOffset;
 
@@ -891,10 +1035,6 @@ namespace Mist{
       thisMappingsR[JSON::Value(pidIt->first).asString()] = pidIt->second;
     }
     meta.inputLocalVars["pidMappingR"] = thisMappingsR;
-
-    INFO_MSG("write header file...");
-    M.toFile((config->getString("input") + ".dtsh").c_str());
-
     return true;
   }
 
@@ -1000,6 +1140,7 @@ namespace Mist{
 
   /// \brief Override userLeadOut to buffer new data as live packets
   void inputHLS::userLeadOut(){
+    Input::userLeadOut();
     if (!isLiveDVR){
       return;
     }
@@ -1007,7 +1148,9 @@ namespace Mist{
     // Update all playlists to make sure listEntries contains all live segments
     for (std::map<uint64_t, Playlist>::iterator pListIt = playlistMapping.begin();
          pListIt != playlistMapping.end(); pListIt++){
-      pListIt->second.reload();
+      if (pListIt->second.reloadNext < Util::bootSecs()){
+        pListIt->second.reload();
+      }
     }
 
     HIGH_MSG("Current playlist has parsed %zu/%" PRIu64 " entries", listEntries[currentPlaylist].size(), parsedSegments[currentPlaylist]);
@@ -1147,7 +1290,7 @@ namespace Mist{
 
     currentIndex = plistEntry - 1;
     currentPlaylist = getMappedTrackPlaylist(trackId);
-    INFO_MSG("Seeking to index %zu on playlist %" PRIu64, currentIndex, currentPlaylist);
+    VERYHIGH_MSG("Seeking to index %zu on playlist %" PRIu64, currentIndex, currentPlaylist);
 
     {// Lock mutex for listEntries
       tthread::lock_guard<tthread::mutex> guard(entryMutex);
@@ -1167,6 +1310,7 @@ namespace Mist{
       if (entry.timeOffset){
         HIGH_MSG("Setting time offset of this TS segment to %" PRId64, entry.timeOffset);
         plsTimeOffset[currentPlaylist] = entry.timeOffset;
+        allowRemap = false;
       }
     }
 
@@ -1372,9 +1516,8 @@ namespace Mist{
         // skip empty lines in the playlist
         continue;
       }
-      if (line.compare(0, 26, "#EXT-X-PLAYLIST-TYPE:EVENT") == 0){
-        isLiveDVR = true;
-      }
+      if (line.compare(0, 26, "#EXT-X-PLAYLIST-TYPE:EVENT") == 0){isLiveDVR = true;}
+      if (line.compare(0, 14, "#EXT-X-ENDLIST") == 0){isLiveDVR = false;}
       if (line.compare(0, 17, "#EXT-X-STREAM-INF") == 0){
         // this is a variant playlist file.. next line is an uri to a playlist
         // file
@@ -1418,7 +1561,7 @@ namespace Mist{
 
         if (codecSupported){
 
-          ret = readPlaylist(playlistRootPath.link(line), fullInit);
+          ret = readPlaylist(playlistRootPath.link(line), line, fullInit);
         }else{
           INFO_MSG("skipping variant playlist %s, none of the codecs are supported",
                    playlistRootPath.link(line).getUrl().c_str());
@@ -1434,7 +1577,7 @@ namespace Mist{
           int pos = line.find("URI");
           if (pos != std::string::npos){
             mediafile = line.substr(pos + 5, line.length() - pos - 6);
-            ret = readPlaylist(playlistRootPath.link(mediafile), fullInit);
+            ret = readPlaylist(playlistRootPath.link(mediafile), mediafile, fullInit);
           }
         }
 
@@ -1460,21 +1603,21 @@ namespace Mist{
     }
 
     if (isRegularPls){
-      ret = readPlaylist(playlistRootPath.getUrl(), fullInit);
+      ret = readPlaylist(playlistRootPath.getUrl(), "", fullInit);
     }
 
     if (!isUrl){fileSource.close();}
 
     uint32_t maxWait = 0;
     unsigned int lastCount = 9999;
-    while (plsTotalCount != plsInitCount && ++maxWait < 50){
+    while (plsTotalCount != plsInitCount && ++maxWait < 1000){
       if (plsInitCount != lastCount){
         lastCount = plsInitCount;
         INFO_MSG("Waiting for variant playlists to load... %u/%u", lastCount, plsTotalCount);
       }
-      Util::sleep(1000);
+      Util::sleep(50);
     }
-    if (maxWait >= 50){
+    if (maxWait >= 1000){
       WARN_MSG("Timeout waiting for variant playlists (%u/%u)", plsInitCount, plsTotalCount);
     }
     plsInitCount = 0;
@@ -1484,14 +1627,14 @@ namespace Mist{
   }
 
   /// Function for reading every playlist.
-  bool inputHLS::readPlaylist(const HTTP::URL &uri, bool fullInit){
+  bool inputHLS::readPlaylist(const HTTP::URL &uri, const  std::string & relurl, bool fullInit){
     std::string urlBuffer;
     // Wildcard streams can have a ' ' in the name, which getUrl converts to a '+'
     if (uri.isLocalPath()){
-      urlBuffer = (fullInit ? "" : ";") + uri.getFilePath();
+      urlBuffer = (fullInit ? "" : ";") + uri.getFilePath() + "\n" + relurl;
     }
     else{
-      urlBuffer = (fullInit ? "" : ";") + uri.getUrl();
+      urlBuffer = (fullInit ? "" : ";") + uri.getUrl() + "\n" + relurl;
     }
     INFO_MSG("Adding playlist(s): %s", urlBuffer.c_str());
     tthread::thread runList(playlistRunner, (void *)urlBuffer.data());
@@ -1550,6 +1693,7 @@ namespace Mist{
     // If we have an offset, load it
     if (ntry.timeOffset){
       plsTimeOffset[currentPlaylist] = ntry.timeOffset;
+      allowRemap = false;
     // Else allow of the offset to be set by getPacketTime
     }else{
       nUTC = ntry.mUTC;

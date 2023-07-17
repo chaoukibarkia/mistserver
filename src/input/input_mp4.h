@@ -73,14 +73,15 @@ namespace Mist{
   class inputMP4 : public Input, public Util::DataCallback {
   public:
     inputMP4(Util::Config *cfg);
-    void dataCallback(const char *ptr, size_t size);
+    virtual void dataCallback(const char *ptr, size_t size);
+    virtual size_t getDataCallbackPos() const;
 
   protected:
     // Private Functions
     bool checkArguments();
     bool preRun();
     bool readHeader();
-    bool needHeader(){return true;}
+    bool needHeader();
     void getNext(size_t idx = INVALID_TRACK_ID);
     void seek(uint64_t seekTime, size_t idx = INVALID_TRACK_ID);
     void handleSeek(uint64_t seekTime, size_t idx);

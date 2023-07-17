@@ -5,8 +5,9 @@
 #include "defines.h"
 #include "dtsc.h"
 #include "encode.h"
-#include "lib/shared_memory.h"
-#include "lib/util.h"
+#include "shared_memory.h"
+#include "util.h"
+#include "stream.h"
 #include <arpa/inet.h> //for htonl/ntohl
 #include <cstdlib>
 #include <cstring>
@@ -130,20 +131,23 @@ namespace DTSC{
   void Packet::reInit(Socket::Connection &src){
     int sleepCount = 0;
     null();
-    int toReceive = 0;
+    Util::ResizeablePointer ptr;
     while (src.connected()){
-      if (!toReceive && src.Received().available(8)){
+      if (!ptr.rsize() && src.Received().available(8)){
         if (src.Received().copy(2) != "DT"){
           WARN_MSG("Invalid DTSC Packet header encountered (%s)",
                    Encodings::Hex::encode(src.Received().copy(4)).c_str());
           break;
         }
-        toReceive = Bit::btohl(src.Received().copy(8).data() + 4);
+        ptr.allocate(Bit::btohl(src.Received().copy(8).data() + 4) + 8);
       }
-      if (toReceive && src.Received().available(toReceive + 8)){
-        std::string dataBuf = src.Received().remove(toReceive + 8);
-        reInit(dataBuf.data(), dataBuf.size());
-        return;
+      unsigned int readable = src.Received().bytes(ptr.rsize() - ptr.size());
+      if (ptr.rsize() && readable){
+        src.Received().remove(ptr, readable);
+        if (ptr.size() == ptr.rsize()){
+          reInit(ptr, ptr.size());
+          return;
+        }
       }
       if (!src.spool()){
         if (sleepCount++ > 750){
@@ -950,12 +954,8 @@ namespace DTSC{
     inFile.read(scanBuf, fileSize);
 
     inFile.close();
-
-    size_t offset = 8;
-    if (!memcmp(scanBuf, "DTP2", 4)){offset = 20;}
-
-    DTSC::Scan src(scanBuf + offset, fileSize - offset);
-    reInit(_streamName, src);
+    DTSC::Packet pkt(scanBuf, fileSize, true);
+    reInit(_streamName, pkt.getScan());
     free(scanBuf);
   }
 
@@ -1684,13 +1684,13 @@ namespace DTSC{
       trackLock.open(pageName, O_CREAT | O_RDWR, ACCESSPERMS, 1);
       if (!trackLock){
         FAIL_MSG("Could not open semaphore to add track!");
-        return -1;
+        return INVALID_TRACK_ID;
       }
       trackLock.wait();
       if (stream.isExit()){
         trackLock.post();
         FAIL_MSG("Not adding track: stream is shutting down");
-        return -1;
+        return INVALID_TRACK_ID;
       }
     }
 
@@ -1855,9 +1855,13 @@ namespace DTSC{
     setInit(trackIdx, init.data(), init.size());
   }
 
-  /// Sets the given track's init data.setvod
+  /// Sets the given track's init data.
   void Meta::setInit(size_t trackIdx, const char *init, size_t initLen){
     DTSC::Track &t = tracks.at(trackIdx);
+    if (initLen > t.trackInitField.size){
+      FAIL_MSG("Attempting to store %zu bytes of init data, but we only have room for %" PRIu32 " bytes!", initLen, t.trackInitField.size);
+      initLen = t.trackInitField.size;
+    }
     char *_init = t.track.getPointer(t.trackInitField);
     Bit::htobs(_init, initLen);
     memcpy(_init + 2, init, initLen);
@@ -2693,134 +2697,6 @@ namespace DTSC{
     return result;
   }
 
-  /// Writes the current Meta object in DTSH format to the given filename
-  void Meta::toFile(const std::string &fName) const{
-    std::string lVars;
-    size_t lVarSize = 0;
-    if (inputLocalVars.size()){
-      lVars = inputLocalVars.toString();
-      lVarSize = 2 + 14 + 5 + lVars.size();
-    }
-
-    std::ofstream oFile(fName.c_str(), std::ios::binary | std::ios::ate);
-    oFile.write(DTSC::Magic_Header, 4);
-    oFile.write(c32(lVarSize + getSendLen() - 8), 4);
-    oFile.write("\340", 1);
-    if (getVod()){oFile.write("\000\003vod\001\000\000\000\000\000\000\000\001", 14);}
-    if (getLive()){oFile.write("\000\004live\001\000\000\000\000\000\000\000\001", 15);}
-    oFile.write("\000\007version\001", 10);
-    oFile.write(c64(DTSH_VERSION), 8);
-    if (lVarSize){
-      oFile.write("\000\016inputLocalVars\002", 17);
-      oFile.write(c32(lVars.size()), 4);
-      oFile.write(lVars.data(), lVars.size());
-    }
-    oFile.write("\000\006tracks\340", 9);
-    for (std::map<size_t, Track>::const_iterator it = tracks.begin(); it != tracks.end(); it++){
-      if (!it->second.parts.getPresent()){continue;}
-      std::string tmp = getTrackIdentifier(it->first, true);
-      oFile.write(c16(tmp.size()), 2);
-      oFile.write(tmp.data(), tmp.size());
-      oFile.write("\340", 1); // Begin track object
-
-      size_t fragCount = it->second.fragments.getPresent();
-      oFile.write("\000\011fragments\002", 12);
-      oFile.write(c32(fragCount * DTSH_FRAGMENT_SIZE), 4);
-      for (size_t i = 0; i < fragCount; i++){
-        oFile.write(c32(it->second.fragments.getInt("duration", i)), 4);
-        oFile.put(it->second.fragments.getInt("keys", i));
-        oFile.write(c32(it->second.fragments.getInt("firstkey", i) + 1), 4);
-        oFile.write(c32(it->second.fragments.getInt("size", i)), 4);
-      }
-
-      size_t keyCount = it->second.keys.getPresent();
-      oFile.write("\000\004keys\002", 7);
-      oFile.write(c32(keyCount * DTSH_KEY_SIZE), 4);
-      for (size_t i = 0; i < keyCount; i++){
-        oFile.write(c64(it->second.keys.getInt("bpos", i)), 8);
-        oFile.write(c24(it->second.keys.getInt("duration", i)), 3);
-        oFile.write(c32(it->second.keys.getInt("number", i) + 1), 4);
-        oFile.write(c16(it->second.keys.getInt("parts", i)), 2);
-        oFile.write(c64(it->second.keys.getInt("time", i)), 8);
-      }
-      oFile.write("\000\010keysizes\002,", 11);
-      oFile.write(c32(keyCount * 4), 4);
-      for (size_t i = 0; i < keyCount; i++){
-        oFile.write(c32(it->second.keys.getInt("size", i)), 4);
-      }
-
-      size_t partCount = it->second.parts.getPresent();
-      oFile.write("\000\005parts\002", 8);
-      oFile.write(c32(partCount * DTSH_PART_SIZE), 4);
-      for (size_t i = 0; i < partCount; i++){
-        oFile.write(c24(it->second.parts.getInt("size", i)), 3);
-        oFile.write(c24(it->second.parts.getInt("duration", i)), 3);
-        oFile.write(c24(it->second.parts.getInt("offset", i)), 3);
-      }
-
-      oFile.write("\000\007trackid\001", 10);
-      oFile.write(c64(it->second.track.getInt("id")), 8);
-
-      if (it->second.track.getInt("missedFrags")){
-        oFile.write("\000\014missed_frags\001", 15);
-        oFile.write(c64(it->second.track.getInt("missedFrags")), 8);
-      }
-
-      oFile.write("\000\007firstms\001", 10);
-      oFile.write(c64(it->second.track.getInt("firstms")), 8);
-      oFile.write("\000\006lastms\001", 9);
-      oFile.write(c64(it->second.track.getInt("lastms")), 8);
-
-      oFile.write("\000\003bps\001", 6);
-      oFile.write(c64(it->second.track.getInt("bps")), 8);
-
-      oFile.write("\000\006maxbps\001", 9);
-      oFile.write(c64(it->second.track.getInt("maxbps")), 8);
-
-      tmp = getInit(it->first);
-      oFile.write("\000\004init\002", 7);
-      oFile.write(c32(tmp.size()), 4);
-      oFile.write(tmp.data(), tmp.size());
-
-      tmp = getCodec(it->first);
-      oFile.write("\000\005codec\002", 8);
-      oFile.write(c32(tmp.size()), 4);
-      oFile.write(tmp.data(), tmp.size());
-
-      tmp = getLang(it->first);
-      if (tmp.size() && tmp != "und"){
-        oFile.write("\000\004lang\002", 7);
-        oFile.write(c32(tmp.size()), 4);
-        oFile.write(tmp.data(), tmp.size());
-      }
-
-      tmp = getType(it->first);
-      oFile.write("\000\004type\002", 7);
-      oFile.write(c32(tmp.size()), 4);
-      oFile.write(tmp.data(), tmp.size());
-
-      if (tmp == "audio"){
-        oFile.write("\000\004rate\001", 7);
-        oFile.write(c64(it->second.track.getInt("rate")), 8);
-        oFile.write("\000\004size\001", 7);
-        oFile.write(c64(it->second.track.getInt("size")), 8);
-        oFile.write("\000\010channels\001", 11);
-        oFile.write(c64(it->second.track.getInt("channels")), 8);
-      }else if (tmp == "video"){
-        oFile.write("\000\005width\001", 8);
-        oFile.write(c64(it->second.track.getInt("width")), 8);
-        oFile.write("\000\006height\001", 9);
-        oFile.write(c64(it->second.track.getInt("height")), 8);
-        oFile.write("\000\004fpks\001", 7);
-        oFile.write(c64(it->second.track.getInt("fpks")), 8);
-      }
-      oFile.write("\000\000\356", 3); // End this track Object
-    }
-    oFile.write("\000\000\356", 3); // End tracks object
-    oFile.write("\000\000\356", 3); // End global object
-    oFile.close();
-  }
-
   /// Converts the current Meta object to JSON format
   void Meta::toJSON(JSON::Value &res, bool skipDynamic, bool tracksOnly) const{
     res.null();
@@ -2835,6 +2711,7 @@ namespace DTSC{
       std::string type = getType(*it);
 
       trackJSON["codec"] = getCodec(*it);
+      trackJSON["codecstring"] = Util::codecString(getCodec(*it), getInit(*it));
       trackJSON["type"] = type;
       trackJSON["idx"] = (uint64_t)*it;
       trackJSON["trackid"] = (uint64_t)getID(*it);
@@ -2885,10 +2762,29 @@ namespace DTSC{
     if (getSource() != ""){res["source"] = getSource();}
   }
 
+  /// Writes the current Meta object in DTSH format to the given uri
+  void Meta::toFile(const std::string &uri) const{
+    // Create writing socket
+    int outFd = -1;
+    if (!Util::externalWriter(uri, outFd, false)){return;}
+    Socket::Connection outFile(outFd, -1);
+    if (outFile){
+      send(outFile, false, getValidTracks(), false);
+      outFile.close();
+    }
+  }
+
   /// Sends the current Meta object through a socket in DTSH format
   void Meta::send(Socket::Connection &conn, bool skipDynamic, std::set<size_t> selectedTracks, bool reID) const{
+    std::string lVars;
+    size_t lVarSize = 0;
+    if (inputLocalVars.size()){
+      lVars = inputLocalVars.toString();
+      lVarSize = 2 + 14 + 5 + lVars.size();
+    }
+
     conn.SendNow(DTSC::Magic_Header, 4);
-    conn.SendNow(c32(getSendLen(skipDynamic, selectedTracks) - 8), 4);
+    conn.SendNow(c32(lVarSize + getSendLen(skipDynamic, selectedTracks) - 8), 4);
     conn.SendNow("\340", 1);
     if (getVod()){conn.SendNow("\000\003vod\001\000\000\000\000\000\000\000\001", 14);}
     if (getLive()){conn.SendNow("\000\004live\001\000\000\000\000\000\000\000\001", 15);}
@@ -2897,6 +2793,11 @@ namespace DTSC{
     if (getLive()){
       conn.SendNow("\000\010unixzero\001", 11);
       conn.SendNow(c64(Util::unixMS() - Util::bootMS() + getBootMsOffset()), 8);
+    }
+    if (lVarSize){
+      conn.SendNow("\000\016inputLocalVars\002", 17);
+      conn.SendNow(c32(lVars.size()), 4);
+      conn.SendNow(lVars.data(), lVars.size());
     }
     conn.SendNow("\000\006tracks\340", 9);
     for (std::set<size_t>::const_iterator it = selectedTracks.begin(); it != selectedTracks.end(); it++){
@@ -2923,7 +2824,7 @@ namespace DTSC{
           conn.SendNow(c32(fragments.getInt("duration", i + fragBegin)), 4);
           conn.SendNow(std::string(1, (char)fragments.getInt("keys", i + fragBegin)));
 
-          conn.SendNow(c32(fragments.getInt("firstkey", i + fragBegin)), 4);
+          conn.SendNow(c32(fragments.getInt("firstkey", i + fragBegin) + 1), 4);
           conn.SendNow(c32(fragments.getInt("size", i + fragBegin)), 4);
         }
 

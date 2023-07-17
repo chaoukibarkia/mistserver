@@ -122,7 +122,7 @@ namespace Mist{
     capa["provides"] = "HTTP";
     capa["protocol"] = "http://";
     capa["url_rel"] = "/$.html";
-    capa["codecs"][0u][0u].append("+*");
+    capa["codecs"][0u].null();
     capa["url_match"].append("/crossdomain.xml");
     capa["url_match"].append("/clientaccesspolicy.xml");
     capa["url_match"].append("/$.html");
@@ -227,7 +227,7 @@ namespace Mist{
   };
 
   void addSources(std::string &streamname, std::set<JSON::Value, sourceCompare> &sources, HTTP::URL url,
-                  JSON::Value &conncapa, JSON::Value &strmMeta, const std::string &useragent){
+                  JSON::Value &conncapa, JSON::Value &strmMeta, const std::string &useragent, bool metaEverywhere){
     url.path += "/";
     if (strmMeta.isMember("live") && conncapa.isMember("exceptions") &&
         conncapa["exceptions"].isObject() && conncapa["exceptions"].size()){
@@ -271,6 +271,7 @@ namespace Mist{
                   if ((!byType && (*trit)["codec"].asStringRef() == strRef.substr(shift)) ||
                       (byType && (*trit)["type"].asStringRef() == strRef.substr(shift)) ||
                       strRef.substr(shift) == "*"){
+                    if (metaEverywhere && (*trit)["type"] == "meta"){continue;}
                     if (allowBFrames || !(trit->isMember("bframes") && (*trit)["bframes"])){
                       matches++;
                       total_matches++;
@@ -294,6 +295,19 @@ namespace Mist{
             if (matches){simul++;}
           }
         }
+
+        // Simulate support for all metadata tracks in every protocol
+        if (metaEverywhere){
+          size_t matches = 0;
+          jsonForEach(strmMeta["tracks"], trit){
+            if ((*trit)["type"] == "meta"){++matches;}
+          }
+          if (matches){
+            total_matches += matches;
+            ++simul;
+          }
+        }
+
         if (simul > most_simul){most_simul = simul;}
       }
     }
@@ -352,13 +366,13 @@ namespace Mist{
     std::string uAgent = req.GetHeader("User-Agent");
 
     std::string forceType = "";
-    if (H.GetVar("forcetype").size()){
+    if (req.GetVar("forcetype").size()){
       forceType = ",forceType:\"" + req.GetVar("forcetype") + "\"";
     }
 
     std::string devSkin = "";
     if (req.GetVar("dev").size()){devSkin = ",skin:\"dev\"";}
-    devSkin += ",urlappend:\"" + H.allVars() + "\"";
+    devSkin += ",urlappend:\"" + req.allVars() + "\"";
     H.SetVar("stream", streamName);
 
     std::string seekTo = "";
@@ -384,6 +398,7 @@ namespace Mist{
       }
     }
     
+    H.Clean();
     H.SetHeader("Content-Type", "text/html");
     H.SetHeader("X-UA-Compatible", "IE=edge");
     if (headersOnly){
@@ -425,7 +440,7 @@ namespace Mist{
     H.Clean();
   }
 
-  JSON::Value OutHTTP::getStatusJSON(std::string &reqHost, const std::string &useragent){
+  JSON::Value OutHTTP::getStatusJSON(std::string &reqHost, const std::string &useragent, bool metaEverywhere){
     JSON::Value json_resp;
     if (config->getString("nostreamtext") != ""){
       json_resp["on_error"] = config->getString("nostreamtext");
@@ -436,6 +451,7 @@ namespace Mist{
       json_resp["redirected"].append(streamName);
     }
     uint8_t streamStatus = Util::getStreamStatus(streamName);
+    uint8_t streamStatusPerc = Util::getStreamStatusPercentage(streamName);
     if (streamStatus != STRMSTAT_READY){
       // If we haven't rewritten the stream name yet to a fallback, attempt to do so
       if (origStreamName == streamName){
@@ -451,7 +467,7 @@ namespace Mist{
             streamName = newStrm;
             Util::setStreamName(streamName);
             reconnect();
-            return getStatusJSON(reqHost, useragent);
+            return getStatusJSON(reqHost, useragent, metaEverywhere);
           }
         }
 
@@ -473,7 +489,7 @@ namespace Mist{
             streamName = newStrm;
             Util::setStreamName(streamName);
             reconnect();
-            return getStatusJSON(reqHost, useragent);
+            return getStatusJSON(reqHost, useragent, metaEverywhere);
           }
         }
         origStreamName.clear(); // no fallback, don't check again
@@ -487,6 +503,7 @@ namespace Mist{
       case STRMSTAT_INVALID: json_resp["error"] = "Stream status is invalid?!"; break;
       default: json_resp["error"] = "Stream status is unknown?!"; break;
       }
+      if (streamStatusPerc){json_resp["perc"] = ((double)streamStatusPerc)/2.55;}
       return json_resp;
     }
     initialize();
@@ -592,7 +609,7 @@ namespace Mist{
             if (jit->asString().size()){altURL = jit->asString();}
             if (!altURL.host.size()){altURL.host = outURL.host;}
             if (!altURL.protocol.size()){altURL.protocol = outURL.protocol;}
-            addSources(streamName, sources, altURL, capa_json, json_resp["meta"], useragent);
+            addSources(streamName, sources, altURL, capa_json, json_resp["meta"], useragent, metaEverywhere);
           }
         }
         // Make note if this connector can be depended upon by other connectors
@@ -620,7 +637,7 @@ namespace Mist{
                 if (jit->asString().size()){altURL = jit->asString();}
                 if (!altURL.host.size()){altURL.host = outURL.host;}
                 if (!altURL.protocol.size()){altURL.protocol = outURL.protocol;}
-                addSources(streamName, sources, altURL, subcapa_json, json_resp["meta"], useragent);
+                addSources(streamName, sources, altURL, subcapa_json, json_resp["meta"], useragent, metaEverywhere);
               }
             }
           }
@@ -652,7 +669,7 @@ namespace Mist{
 
     // Handle certbot validations
     if (req.url.substr(0, 28) == "/.well-known/acme-challenge/"){
-      std::string cbToken = H.url.substr(28);
+      std::string cbToken = req.url.substr(28);
       jsonForEach(config->getOption("certbot", true), it){
         if (it->asStringRef().substr(0, cbToken.size() + 1) == cbToken + ":"){
           H.SetHeader("Content-Type", "text/plain");
@@ -800,12 +817,12 @@ namespace Mist{
         (req.url.length() > 9 && req.url.substr(0, 6) == "/json_" && req.url.substr(req.url.length() - 3, 3) == ".js")){
       HTTPOutput::respondHTTP(req, headersOnly);
       if (websocketHandler(req, headersOnly)){return;}
+      bool metaEverywhere = req.GetVar("metaeverywhere").size();
       std::string reqHost = HTTP::URL(req.GetHeader("Host")).host;
       std::string useragent = req.GetVar("ua");
       if (!useragent.size()){useragent = req.GetHeader("User-Agent");}
       std::string response;
       std::string rURL = req.url;
-      if (headersOnly){initialize();}
       if (rURL.substr(0, 6) != "/json_"){
         H.SetHeader("Content-Type", "application/javascript");
       }else{
@@ -818,7 +835,7 @@ namespace Mist{
         return;
       }
       response = "// Generating info code for stream " + streamName + "\n\nif (!mistvideo){var mistvideo ={};}\n";
-      JSON::Value json_resp = getStatusJSON(reqHost, useragent);
+      JSON::Value json_resp = getStatusJSON(reqHost, useragent, metaEverywhere);
       if (rURL.substr(0, 6) != "/json_"){
         response += "mistvideo['" + streamName + "'] = " + json_resp.toString() + ";\n";
       }else{
@@ -1071,7 +1088,7 @@ namespace Mist{
       H.Clean();
       return;
     }
-    if (H.url == "/libde265.js"){
+    if (req.url == "/libde265.js"){
       std::string response;
       H.Clean();
       H.SetHeader("Server", "MistServer/" PACKAGE_VERSION);
@@ -1114,6 +1131,7 @@ namespace Mist{
   bool OutHTTP::websocketHandler(const HTTP::Parser & req, bool headersOnly){
     stayConnected = true;
     std::string reqHost = HTTP::URL(req.GetHeader("Host")).host;
+    bool metaEverywhere = req.GetVar("metaeverywhere").size();
     if (req.GetHeader("X-Mst-Path").size()){mistPath = req.GetHeader("X-Mst-Path");}
     std::string useragent = req.GetVar("ua");
     if (!useragent.size()){useragent = req.GetHeader("User-Agent");}
@@ -1124,26 +1142,30 @@ namespace Mist{
     if (!ws){return false;}
     setBlocking(false);
     // start the stream, if needed
-    Util::startInput(streamName, "", true, false);
+    Util::sanitizeName(streamName);
+    if (!Util::streamAlive(streamName)){Util::startInput(streamName, "", true, false);}
 
     char pageName[NAME_BUFFER_SIZE];
     std::string currStreamName;
     currStreamName = streamName;
     snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-    IPC::sharedPage streamStatus(pageName, 1, false, false);
+    IPC::sharedPage streamStatus(pageName, 2, false, false);
     uint8_t prevState, newState, pingCounter = 0;
+    uint8_t prevStatePerc = 0, newStatePerc = 0;
     std::set<size_t> prevTracks;
     prevState = newState = STRMSTAT_INVALID;
     while (keepGoing()){
-      if (!streamStatus || !streamStatus.exists()){streamStatus.init(pageName, 1, false, false);}
+      if (!streamStatus || !streamStatus.exists()){streamStatus.init(pageName, 2, false, false);}
       if (!streamStatus){
         newState = STRMSTAT_OFF;
+        newStatePerc = 0;
       }else{
         newState = streamStatus.mapped[0];
+        if (streamStatus.len > 1){newStatePerc = streamStatus.mapped[1];}
       }
 
       if (meta){meta.reloadReplacedPagesIfNeeded();}
-      if (newState != prevState || (newState == STRMSTAT_READY && M.getValidTracks() != prevTracks)){
+      if (newState != prevState || (newState == STRMSTAT_READY && M.getValidTracks() != prevTracks) || (newState != STRMSTAT_READY && newStatePerc != prevStatePerc)){
         if (newState == STRMSTAT_READY){
           thisError = "";
           reconnect();
@@ -1154,7 +1176,7 @@ namespace Mist{
         JSON::Value resp;
         // Check if we have an error message set
         if (thisError == ""){
-          resp = getStatusJSON(reqHost, useragent);
+          resp = getStatusJSON(reqHost, useragent, metaEverywhere);
         }else{
           resp["error"] = "Could not retrieve stream. Sorry.";
           resp["error_guru"] = thisError;
@@ -1169,6 +1191,7 @@ namespace Mist{
         }
         ws.sendFrame(resp.toString());
         prevState = newState;
+        prevStatePerc = newStatePerc;
       }else{
         if (newState == STRMSTAT_READY){stats();}
         if (myConn.spool() && ws.readFrame()){

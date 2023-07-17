@@ -4,6 +4,7 @@
 #include "controller_statistics.h"
 #include "controller_storage.h"
 #include "controller_streams.h"
+#include "controller_external_writers.h"
 #include <dirent.h> //for browse API call
 #include <fstream>
 #include <mist/auth.h>
@@ -19,6 +20,7 @@
 /*LTS-START*/
 #include "controller_limits.h"
 #include "controller_push.h"
+#include "controller_variables.h"
 #include "controller_updater.h"
 /*LTS-END*/
 
@@ -439,12 +441,22 @@ int Controller::handleAPIConnection(Socket::Connection &conn){
 
 void Controller::handleUDPAPI(void *np){
   Socket::UDPConnection uSock(true);
-  if (!uSock.bind(UDP_API_PORT, UDP_API_HOST)){
+  uint16_t boundPort = uSock.bind(UDP_API_PORT, UDP_API_HOST);
+  if (!boundPort){
     FAIL_MSG("Could not open local API UDP socket - not all functionality will be available");
     return;
   }
+  HTTP::URL boundAddr;
+  boundAddr.protocol = "udp";
+  boundAddr.setPort(boundPort);
+  boundAddr.host = uSock.getBoundAddress();
+  {
+    tthread::lock_guard<tthread::mutex> guard(configMutex);
+    udpApiBindAddr = boundAddr.getUrl();
+    Controller::writeConfig();
+  }
   Util::Procs::socketList.insert(uSock.getSock());
-  uSock.SetDestination(UDP_API_HOST, UDP_API_PORT);
+  uSock.allocateDestination();
   while (Controller::conf.is_active){
     if (uSock.Receive()){
       MEDIUM_MSG("UDP API: %s", (const char*)uSock.data);
@@ -538,6 +550,11 @@ void Controller::handleAPICommands(JSON::Value &Request, JSON::Value &Response){
     skip.insert("online");
     skip.insert("error");
     Response["config_backup"].assignFrom(Controller::Storage, skip);
+  }
+
+  if (Request.isMember("config_reload")){
+    INFO_MSG("Reloading configuration from disk on request");
+    Controller::readConfigFromDisk();
   }
 
   if (Request.isMember("config_restore")){
@@ -1180,13 +1197,13 @@ void Controller::handleAPICommands(JSON::Value &Request, JSON::Value &Response){
     }
   }
 
-  if (Request.isMember("push_auto_add")){Controller::addPush(Request["push_auto_add"]);}
+  if (Request.isMember("push_auto_add")){Controller::addPush(Request["push_auto_add"], Response["push_list"]);}
 
   if (Request.isMember("push_auto_remove")){
     if (Request["push_auto_remove"].isArray()){
-      jsonForEach(Request["push_auto_remove"], it){Controller::removePush(*it);}
+      jsonForEach(Request["push_auto_remove"], it){Controller::removePush(*it, Response["push_list"]);}
     }else{
-      Controller::removePush(Request["push_auto_remove"]);
+      Controller::removePush(Request["push_auto_remove"], Response["push_list"]);
     }
   }
 
@@ -1198,12 +1215,22 @@ void Controller::handleAPICommands(JSON::Value &Request, JSON::Value &Response){
     Controller::pushSettings(Request["push_settings"], Response["push_settings"]);
   }
 
+  if (Request.isMember("variable_list")){Controller::listCustomVariables(Response["variable_list"]);}
+  if (Request.isMember("variable_add")){Controller::addVariable(Request["variable_add"], Response["variable_list"]);}
+  if (Request.isMember("variable_remove")){Controller::removeVariable(Request["variable_remove"], Response["variable_list"]);}
+
+  if (Request.isMember("external_writer_remove")){Controller::removeExternalWriter(Request["external_writer_remove"]);}
+  if (Request.isMember("external_writer_add")){Controller::addExternalWriter(Request["external_writer_add"]);}
+  if (Request.isMember("external_writer_remove") || Request.isMember("external_writer_add") || 
+      Request.isMember("external_writer_list")){
+    Controller::listExternalWriters(Response["external_writer_list"]);
+  }
+
   Controller::writeConfig();
-  Controller::configChanged = false;
 
   if (Request.isMember("save")){
     Controller::Log("CONF", "Writing config to file on request through API");
-    Controller::writeConfigToDisk();
+    Controller::writeConfigToDisk(true);
   }
 
 }

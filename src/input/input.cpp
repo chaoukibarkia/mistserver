@@ -8,18 +8,22 @@
 #include <iterator>
 #include <mist/auth.h>
 #include <mist/defines.h>
-#include <mist/downloader.h>
 #include <mist/encode.h>
 #include <mist/procs.h>
 #include <mist/stream.h>
 #include <mist/triggers.h>
+#include <mist/urireader.h>
 #include <sstream>
 #include <sys/wait.h>
 
 namespace Mist{
   Util::Config *Input::config = NULL;
 
-  void Input::userLeadIn(){connectedUsers = 0;}
+  void Input::userLeadIn(){
+    connectedUsers = 0;
+    keyLoadPriority.clear();
+  }
+
   void Input::userOnActive(size_t id){
     ++connectedUsers;
     size_t track = users.getTrack(id);
@@ -36,12 +40,47 @@ namespace Mist{
     //But! What if our current key is 20+ seconds long? HAVE YOU THOUGHT OF THAT?!
     //Exactly! I thought not! So, if the end key number == the first, we increase by one.
     if (endKey == key){++endKey;}
-    DONTEVEN_MSG("User with ID:%zu is on key %zu->%zu (timestamp %" PRIu64 ")", id, key, endKey, time);
-    for (size_t i = key; i <= endKey; i++){bufferFrame(track, i);}
+    if (endKey > key + 1000){endKey = key + 1000;}
+    DONTEVEN_MSG("User with ID:%zu is on %zu:%zu -> %zu (timestamp %" PRIu64 ")", id, track, key, endKey, time);
+    for (size_t i = key; i <= endKey; ){
+
+
+      const Util::RelAccX &tPages = M.pages(track);
+      if (!tPages.getEndPos()){return;}
+      DTSC::Keys keys(M.keys(track));
+      if (i > keys.getValidCount()){return;}
+      uint64_t pageIdx = 0;
+      for (uint64_t j = tPages.getDeleted(); j < tPages.getEndPos(); j++){
+        if (tPages.getInt("firstkey", j) > i) break;
+        pageIdx = j;
+      }
+      uint32_t pageNumber = tPages.getInt("firstkey", pageIdx);
+      uint64_t pageTime = M.getTimeForKeyIndex(track, pageNumber);
+      if (pageTime < time){
+        keyLoadPriority[trackKey(track, pageNumber)] += 10000;
+      }else{
+        keyLoadPriority[trackKey(track, pageNumber)] += 600 - (pageTime - time) / 1000;
+      }
+      uint64_t cnt = tPages.getInt("keycount", pageIdx);
+      if (pageNumber + cnt <= i){return;}
+      i = pageNumber + cnt;
+    }
     //Now, we can rest assured that the next ~120 seconds or so is pre-buffered in RAM.
   }
   void Input::userOnDisconnect(size_t id){}
-  void Input::userLeadOut(){}
+  void Input::userLeadOut(){
+    if (!keyLoadPriority.size()){return;}
+    //Make reverse mapping
+    std::multimap<uint64_t, trackKey> reverse;
+    for (std::map<trackKey, uint64_t>::iterator i = keyLoadPriority.begin(); i != keyLoadPriority.end(); ++i){
+      reverse.insert(std::pair<uint64_t, trackKey>(i->second, i->first));
+      VERYHIGH_MSG("Key priority for %zu:%zu = %" PRIu64, i->first.track, i->first.key, i->second);
+    }
+    uint64_t timer = Util::bootMS();
+    for (std::multimap<uint64_t, trackKey>::reverse_iterator i = reverse.rbegin(); i != reverse.rend() && Util::bootMS() < timer + INPUT_USER_INTERVAL; ++i){
+      bufferFrame(i->second.track, i->second.key);
+    }
+  }
 
   void Input::reloadClientMeta(){
     if (M.getStreamName() != "" && M.getMaster()){return;}
@@ -182,40 +221,51 @@ namespace Mist{
     srtTrack = 0;
     lastBufferCheck = 0;
     bufferPid = 0;
+    internalOnly = false;
+    isBuffer = false;
+    startTime = Util::bootSecs();
+    lastStats = 0;
   }
 
-  void Input::checkHeaderTimes(std::string streamFile){
-    struct stat bufStream;
-    struct stat bufHeader;
-    struct stat srtStream;
+  void Input::checkHeaderTimes(const HTTP::URL & streamFile){
 
-    std::string srtFile = streamFile + ".srt";
-    if (stat(srtFile.c_str(), &srtStream) == 0){
-      hasSrt = true;
-      srtSource.open(srtFile.c_str());
-      INFO_MSG("File %s opened as srt source", srtFile.c_str());
+    /// \TODO Implement remote URLs?
+
+    if (streamFile.isLocalPath()){
+      const std::string & f = streamFile.getFilePath();
+
+      struct stat bufStream;
+      struct stat bufHeader;
+      struct stat srtStream;
+      std::string srtFile = f + ".srt";
+      if (stat(srtFile.c_str(), &srtStream) == 0){
+        hasSrt = true;
+        srtSource.open(srtFile.c_str());
+        INFO_MSG("File %s opened as srt source", srtFile.c_str());
+      }
+
+      if (stat(f.c_str(), &bufStream) != 0){
+        INSANE_MSG("Source is not a file - ignoring header check");
+        return;
+      }
+      std::string headerFile = f + ".dtsh";
+      if (stat(headerFile.c_str(), &bufHeader) != 0){
+        INSANE_MSG("No header exists to compare - ignoring header check");
+        return;
+      }
+      // the same second is not enough - add a 15 second window where we consider it too old
+      if (bufHeader.st_mtime < bufStream.st_mtime + 15){
+        INFO_MSG("Overwriting outdated DTSH header file: %s ", headerFile.c_str());
+        remove(headerFile.c_str());
+      }
+
+      // the same second is not enough - add a 15 second window where we consider it too old
+      if (hasSrt && bufHeader.st_mtime < srtStream.st_mtime + 15){
+        INFO_MSG("Overwriting outdated DTSH header file: %s ", headerFile.c_str());
+        remove(headerFile.c_str());
+      }
     }
 
-    if (stat(streamFile.c_str(), &bufStream) != 0){
-      INSANE_MSG("Source is not a file - ignoring header check");
-      return;
-    }
-    std::string headerFile = streamFile + ".dtsh";
-    if (stat(headerFile.c_str(), &bufHeader) != 0){
-      INSANE_MSG("No header exists to compare - ignoring header check");
-      return;
-    }
-    // the same second is not enough - add a 15 second window where we consider it too old
-    if (bufHeader.st_mtime < bufStream.st_mtime + 15){
-      INFO_MSG("Overwriting outdated DTSH header file: %s ", headerFile.c_str());
-      remove(headerFile.c_str());
-    }
-
-    // the same second is not enough - add a 15 second window where we consider it too old
-    if (hasSrt && bufHeader.st_mtime < srtStream.st_mtime + 15){
-      INFO_MSG("Overwriting outdated DTSH header file: %s ", headerFile.c_str());
-      remove(headerFile.c_str());
-    }
   }
 
   void Input::readSrtHeader(){
@@ -309,6 +359,45 @@ namespace Mist{
 
     INFO_MSG("Input booting");
 
+    //Check if the input uses the name-based-override, and strip it
+    {
+      std::string input = config->getString("input");
+      std::string prefix = capa["name"].asStringRef() + ":";
+      Util::stringToLower(prefix);
+      if (input.size() > prefix.size()){
+        std::string match = input.substr(0, prefix.size());
+        Util::stringToLower(match);
+        if (prefix == match){
+          //We have a prefix match - make sure we don't _also_ have a proper source_match
+          bool source_match = false;
+          if (capa["source_match"].size()){
+            jsonForEach(capa["source_match"], it){
+              const std::string & source = it->asStringRef();
+              std::string front = source.substr(0, source.find('*'));
+              std::string back = source.substr(source.find('*') + 1);
+
+              if (input.size() > front.size()+back.size() && input.substr(0, front.size()) == front && input.substr(input.size() - back.size()) == back){
+                source_match = true;
+                break;
+              }
+            }
+          }else{
+            const std::string & source = capa["source_match"].asStringRef();
+            std::string front = source.substr(0, source.find('*'));
+            std::string back = source.substr(source.find('*') + 1);
+
+            if (input.size() > front.size()+back.size() && input.substr(0, front.size()) == front && input.substr(input.size() - back.size()) == back){
+              source_match = true;
+            }
+          }
+          //Only if no source_match, strip the prefix from the input string
+          if (!source_match){
+            config->getOption("input", true).append(input.substr(prefix.size()));
+          }
+        }
+      }
+    }
+
     if (!checkArguments()){
       FAIL_MSG("Setup failed - exiting");
       return 0;
@@ -334,7 +423,8 @@ namespace Mist{
         //Set stream status to STRMSTAT_INIT, then close the page in non-master mode to keep it around
         char pageName[NAME_BUFFER_SIZE];
         snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-        streamStatus.init(pageName, 1, true, false);
+        streamStatus.init(pageName, 2, false, false);
+        if (!streamStatus){streamStatus.init(pageName, 2, true, false);}
         if (streamStatus){streamStatus.mapped[0] = STRMSTAT_INIT;}
         streamStatus.master = false;
         streamStatus.close();
@@ -381,7 +471,8 @@ namespace Mist{
         // Re-init streamStatus, previously closed
         char pageName[NAME_BUFFER_SIZE];
         snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-        streamStatus.init(pageName, 1, true, false);
+        streamStatus.init(pageName, 2, false, false);
+        if (!streamStatus){streamStatus.init(pageName, 2, true, false);}
         streamStatus.master = false;
         if (streamStatus){streamStatus.mapped[0] = STRMSTAT_INIT;}
       }
@@ -391,8 +482,11 @@ namespace Mist{
         playerLock.unlink();
         char pageName[NAME_BUFFER_SIZE];
         snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-        streamStatus.init(pageName, 1, true, false);
-        streamStatus.close();
+        streamStatus.init(pageName, 2, false, false);
+        if (streamStatus){
+          streamStatus.master = true;
+          streamStatus.close();
+        }
       }
       playerLock.unlink();
       pullLock.unlink();
@@ -412,7 +506,8 @@ namespace Mist{
           // Re-init streamStatus, previously closed
           char pageName[NAME_BUFFER_SIZE];
           snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-          streamStatus.init(pageName, 1, true, false);
+          streamStatus.init(pageName, 2, false, false);
+          if (!streamStatus){streamStatus.init(pageName, 2, true, false);}
           streamStatus.master = false;
           if (streamStatus){streamStatus.mapped[0] = STRMSTAT_INIT;}
         }
@@ -450,7 +545,7 @@ namespace Mist{
       if (playerLock){
         char pageName[NAME_BUFFER_SIZE];
         snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-        streamStatus.init(pageName, 1, true, false);
+        streamStatus.init(pageName, 2, false, false);
         if (streamStatus){streamStatus.mapped[0] = STRMSTAT_INVALID;}
       }
 #if DEBUG >= DLVL_DEVEL
@@ -477,12 +572,17 @@ namespace Mist{
       char pageName[NAME_BUFFER_SIZE];
       snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_IPID, streamName.c_str());
       pidPage.init(pageName, 8, false, false);
-      pidPage.master = true;
-      pidPage.close();
+      if (pidPage){
+        pidPage.master = true;
+        pidPage.close();
+      }
       //Clear stream state
       snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_STATE, streamName.c_str());
-      streamStatus.init(pageName, 1, true, false);
-      streamStatus.close();
+      streamStatus.init(pageName, 2, false, false);
+      if (streamStatus){
+        streamStatus.master = true;
+        streamStatus.close();
+      }
       //Delete lock
       playerLock.unlink();
     }
@@ -504,17 +604,20 @@ namespace Mist{
   int Input::run(){
     Comms::sessionConfigCache();
     if (streamStatus){streamStatus.mapped[0] = STRMSTAT_BOOT;}
-    checkHeaderTimes(config->getString("input"));
+    checkHeaderTimes(HTTP::localURIResolver().link(config->getString("input")));
+    //needHeader internally calls readExistingHeader which in turn attempts to read header cache
     if (needHeader()){
-      uint64_t timer = Util::bootMS();
-      bool headerSuccess = readHeader();
-      if (!headerSuccess || (!M && needsLock())){
+      uint64_t timer = Util::getMicros();
+      if (!readHeader() || (!M && needsLock())){
         FAIL_MSG("Reading header for '%s' failed.", config->getString("input").c_str());
         return 0;
       }
-      timer = Util::bootMS() - timer;
-      INFO_MSG("Read header in %" PRIu64 "ms (%zu tracks)", timer, M?M.trackCount():(size_t)0);
+      timer = Util::getMicros(timer);
+      INFO_MSG("Created header in %.3f ms (%zu tracks)", (double)timer/1000.0, M?M.trackCount():(size_t)0);
+      //Write header to file for caching purposes
+      M.toFile(config->getString("input") + ".dtsh");
     }
+    postHeader();
     if (config->getBool("headeronly")){return 0;}
     if (M && M.getVod()){
       meta.removeEmptyTracks();
@@ -587,6 +690,7 @@ namespace Mist{
     }
     // close file
     file.close();
+    // Export DTSH to a file or remote target
     outMeta.toFile(fileName + ".dtsh");
   }
 
@@ -624,22 +728,21 @@ namespace Mist{
   /// ~~~~~~~~~~~~~~~
   void Input::serve(){
     users.reload(streamName, true);
-    Comms::Connections statComm;
-    uint64_t startTime = Util::bootSecs();
+    startTime = Util::bootSecs();
 
     if (!M){
       // Initialize meta page
       meta.reInit(streamName, true);
     }else{
-      std::set<size_t> validTracks = M.getValidTracks(true);
-      for (std::set<size_t>::iterator it = validTracks.begin(); it != validTracks.end(); it++){
-        bufferFrame(*it, 0);
-      }
+      //std::set<size_t> validTracks = M.getValidTracks(true);
+      //for (std::set<size_t>::iterator it = validTracks.begin(); it != validTracks.end(); it++){
+      //  bufferFrame(*it, 0);
+      //}
     }
     meta.setSource(config->getString("input"));
 
-    bool internalOnly = (config->getString("input").find("INTERNAL_ONLY") != std::string::npos);
-    bool isBuffer = (capa["name"].asStringRef() == "Buffer");
+    internalOnly = (config->getString("input").find("INTERNAL_ONLY") != std::string::npos);
+    isBuffer = (capa["name"].asStringRef() == "Buffer");
 
     /*LTS-START*/
     if (Triggers::shouldTrigger("STREAM_READY", config->getString("streamname"))){
@@ -656,6 +759,7 @@ namespace Mist{
     activityCounter = Util::bootSecs();
     // main serve loop
     while (keepRunning()){
+      uint64_t preMs = Util::bootMS();
       // load pages for connected clients on request
       userLeadIn();
       COMM_LOOP(users, userOnActive(id), userOnDisconnect(id))
@@ -668,22 +772,17 @@ namespace Mist{
         uint64_t currLastUpdate = M.getLastUpdated();
         if (currLastUpdate > activityCounter){activityCounter = currLastUpdate;}
       }else{
-        if (connectedUsers && M.getValidTracks().size()){activityCounter = Util::bootSecs();}
+        if ((connectedUsers || isAlwaysOn()) && M.getValidTracks().size()){activityCounter = Util::bootSecs();}
       }
-      // Connect to stats for INPUT detection
-      if (!internalOnly && !isBuffer){
-        if (!statComm){statComm.reload(streamName, getConnectedBinHost(), JSON::Value(getpid()).asString(), "INPUT:" + capa["name"].asStringRef(), "");}
-        if (statComm){
-          uint64_t now = Util::bootSecs();
-          statComm.setNow(now);
-          statComm.setStream(streamName);
-          statComm.setTime(now - startTime);
-          statComm.setLastSecond(0);
-          connStats(statComm);
-        }
-      }
+
+      inputServeStats();
       // if not shutting down, wait 1 second before looping
-      if (config->is_active){Util::wait(INPUT_USER_INTERVAL);}
+      preMs = Util::bootMS() - preMs;
+      uint64_t waitMs = INPUT_USER_INTERVAL;
+      if (preMs >= waitMs){waitMs = 0;}else{waitMs -= preMs;}
+      if (config->is_active && waitMs){
+        Util::wait(waitMs);
+      }
     }
     if (!isThread()){
       if (streamStatus){streamStatus.mapped[0] = STRMSTAT_SHUTDOWN;}
@@ -694,6 +793,23 @@ namespace Mist{
     userSelect.clear();
     if (!isThread()){
       if (streamStatus){streamStatus.mapped[0] = STRMSTAT_OFF;}
+    }
+  }
+
+  void Input::inputServeStats(){
+    uint64_t now = Util::bootSecs();
+    if (now != lastStats){
+      if (!internalOnly && !isBuffer){
+        if (!statComm){statComm.reload(streamName, getConnectedBinHost(), JSON::Value(getpid()).asString(), "INPUT:" + capa["name"].asStringRef(), "");}
+        if (statComm){
+          statComm.setNow(now);
+          statComm.setStream(streamName);
+          statComm.setTime(now - startTime);
+          statComm.setLastSecond(0);
+          connStats(statComm);
+        }
+      }
+      lastStats = now;
     }
   }
 
@@ -708,10 +824,6 @@ namespace Mist{
     // - INPUT_TIMEOUT seconds haven't passed yet,
     // - this is a live stream and at least two of the biggest fragment haven't passed yet,
     bool ret = config->is_active && ((Util::bootSecs() - activityCounter) < INPUT_TIMEOUT);
-    if (!ret && config->is_active && isAlwaysOn()){
-      ret = true;
-      activityCounter = Util::bootSecs();
-    }
     /*LTS-START*/
     if (!ret){
       if (Triggers::shouldTrigger("STREAM_UNLOAD", config->getString("streamname"))){
@@ -859,7 +971,6 @@ namespace Mist{
   void Input::connStats(Comms::Connections &statComm){
     statComm.setUp(0);
     statComm.setDown(streamByteCount());
-    statComm.setHost(getConnectedBinHost());
   }
 
   void Input::realtimeMainLoop(){
@@ -1088,10 +1199,12 @@ namespace Mist{
     return r.str();
   }
 
+  /// Attempts to create a header.
+  /// Returns true on success.
+  /// Default implementation fails and prints a warning.
   bool Input::readHeader(){
-    INFO_MSG("Empty header created by default readHeader handler");
-    meta.reInit(streamName);
-    return true;
+    WARN_MSG("Default readHeader implementation called - this is not expected to happen");
+    return false;
   }
 
   void Input::parseHeader(){
@@ -1335,6 +1448,8 @@ namespace Mist{
 
     uint64_t keyTime = keys.getTime(keyNum);
 
+    inputServeStats();
+
     bool isSrt = (hasSrt && idx == srtTrack);
     if (isSrt){
       srtSource.clear();
@@ -1381,6 +1496,7 @@ namespace Mist{
       for (size_t i = 0; i < keyNum; ++i){partNo += keys.getParts(i);}
       DTSC::Parts parts(M.parts(idx));
       while (thisPacket && thisTime < stopTime){
+        if (connectedUsers || isAlwaysOn()){activityCounter = Util::bootSecs();}
         if (thisTime >= lastBuffered){
           if (sourceIdx != idx){
             if (encryption.find(":") != std::string::npos || M.getEncryption(idx).find(":") != std::string::npos){
@@ -1424,7 +1540,15 @@ namespace Mist{
           size_t dataLen;
           thisPacket.getString("data", data, dataLen);
           if (dataLen != parts.getSize(partNo)){
-            INFO_MSG("Part %zu (@%" PRIu64 ") size mismatch: %zu (actual) != %zu (expected)", partNo, thisTime, dataLen, parts.getSize(partNo));
+            if (partNo && dataLen == parts.getSize(partNo-1)){
+              FAIL_MSG("Part size for part %zu (%" PRIu64 "ms) matches part before it, instead. Aborting page load!", partNo, thisTime);
+              break;
+            }else if (dataLen == parts.getSize(partNo+1)){
+              FAIL_MSG("Part size for part %zu (%" PRIu64 "ms) matches part after it, instead. Aborting page load!", partNo, thisTime);
+              break;
+            }else{
+              INFO_MSG("Part %zu (@%" PRIu64 ") size mismatch: %zu (actual) != %zu (expected)", partNo, thisTime, dataLen, parts.getSize(partNo));
+            }
           }
           ++partNo;
           HIGH_MSG("Buffering VoD packet (%zuB) @%" PRIu64 " ms on track %zu with offset %" PRIu64, dataLen, thisTime, idx, thisPacket.getInt("offset"));
@@ -1434,6 +1558,7 @@ namespace Mist{
           byteCounter += thisPacket.getDataLen();
           lastBuffered = thisTime;
         }
+        inputServeStats();
         getNext(sourceIdx);
       }
       //Sanity check: are we matching the key's data size?
@@ -1455,12 +1580,22 @@ namespace Mist{
     }
     bufferFinalize(idx, page);
     bufferTimer = Util::bootMS() - bufferTimer;
-    INFO_MSG("Track %zu, page %" PRIu32 " (%" PRIu64 " - %" PRIu64 " ms) buffered in %" PRIu64 "ms",
-             idx, pageNumber, tPages.getInt("firsttime", pageIdx), thisTime, bufferTimer);
-    INFO_MSG("  (%" PRIu32 "/%" PRIu64 " parts, %" PRIu64 " bytes)", packCounter,
-             tPages.getInt("parts", pageIdx), byteCounter);
-    pageCounter[idx][pageNumber] = Util::bootSecs();
-    return true;
+    if (packCounter != tPages.getInt("parts", pageIdx)){
+      FAIL_MSG("Track %zu, page %" PRIu32 " (" PRETTY_PRINT_MSTIME " - " PRETTY_PRINT_MSTIME ") NOT FULLY buffered in %" PRIu64 "ms - erasing for later retry",
+               idx, pageNumber, PRETTY_ARG_MSTIME(tPages.getInt("firsttime", pageIdx)), PRETTY_ARG_MSTIME(thisTime), bufferTimer);
+      INFO_MSG("  (%" PRIu32 "/%" PRIu64 " parts, %" PRIu64 " bytes)", packCounter,
+               tPages.getInt("parts", pageIdx), byteCounter);
+      pageCounter[idx].erase(pageNumber);
+      bufferRemove(idx, pageNumber);
+      return false;
+    }else{
+      INFO_MSG("Track %zu, page %" PRIu32 " (" PRETTY_PRINT_MSTIME " - " PRETTY_PRINT_MSTIME ") buffered in %" PRIu64 "ms",
+               idx, pageNumber, PRETTY_ARG_MSTIME(tPages.getInt("firsttime", pageIdx)), PRETTY_ARG_MSTIME(thisTime), bufferTimer);
+      INFO_MSG("  (%" PRIu32 "/%" PRIu64 " parts, %" PRIu64 " bytes)", packCounter,
+               tPages.getInt("parts", pageIdx), byteCounter);
+      pageCounter[idx][pageNumber] = Util::bootSecs();
+      return true;
+    }
   }
 
   bool Input::atKeyFrame(){
@@ -1475,28 +1610,34 @@ namespace Mist{
   }
 
   bool Input::readExistingHeader(){
-    if (config->getBool("realtime")){
-      meta.reInit("", config->getString("input") + ".dtsh");
-      if (!meta){return false;}
-      if (meta.version != DTSH_VERSION){
-        INFO_MSG("Updating wrong version header file from version %u to %u", meta.version, DTSH_VERSION);
-        return false;
-      }
-      return meta;
-    }
-    char pageName[NAME_BUFFER_SIZE];
-    snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_META, config->getString("streamname").c_str());
-    IPC::sharedPage sp(pageName, 0, false, false);
-    if (sp){
-      sp.close();
-      meta.reInit(config->getString("streamname"), false);
-      if (meta){
-        meta.setMaster(true);
-        INFO_MSG("Read existing header");
-        return true;
+    if (!config->getBool("realtime")){
+      char pageName[NAME_BUFFER_SIZE];
+      snprintf(pageName, NAME_BUFFER_SIZE, SHM_STREAM_META, config->getString("streamname").c_str());
+      IPC::sharedPage sp(pageName, 0, false, false);
+      if (sp){
+        sp.close();
+        meta.reInit(config->getString("streamname"), false);
+        if (meta){
+          meta.setMaster(true);
+          INFO_MSG("Read existing header");
+          return true;
+        }
       }
     }
-    meta.reInit(config->getString("streamname"), config->getString("input") + ".dtsh");
+    // Try to read any existing DTSH file
+    std::string fileName = config->getString("input") + ".dtsh";
+    HIGH_MSG("Loading metadata for stream '%s' from file '%s'", streamName.c_str(), fileName.c_str());
+    char *scanBuf;
+    size_t fileSize;
+    HTTP::URIReader inFile(fileName);
+    if (!inFile){return false;}
+    inFile.readAll(scanBuf, fileSize);
+    inFile.close();
+    if (!fileSize){return false;}
+    DTSC::Packet pkt(scanBuf, fileSize, true);
+    HIGH_MSG("Retrieved header of %zu bytes", fileSize);
+    meta.reInit(config->getBool("realtime") ? "" : streamName, pkt.getScan());
+
     if (meta.version != DTSH_VERSION){
       INFO_MSG("Updating wrong version header file from version %u to %u", meta.version, DTSH_VERSION);
       return false;

@@ -11,6 +11,7 @@
 #include <mist/socket.h>
 #include <mist/timing.h>
 #include <mist/stream.h>
+#include <mist/url.h>
 #include <set>
 
 namespace Mist{
@@ -31,8 +32,6 @@ namespace Mist{
     /*LTS-START*/
     std::string reqUrl;
     /*LTS-END*/
-    std::string previousFile;
-    std::string currentFile;
     // non-virtual generic functions
     virtual int run();
     virtual void stats(bool force = false);
@@ -45,7 +44,7 @@ namespace Mist{
     uint64_t endTime();
     void setBlocking(bool blocking);
     bool selectDefaultTracks();
-    bool connectToFile(std::string file, bool append = false);
+    bool connectToFile(std::string file, bool append = false, Socket::Connection *conn = 0);
     static bool listenMode(){return true;}
     uint32_t currTrackCount() const;
     virtual bool isReadyForPlay();
@@ -93,6 +92,9 @@ namespace Mist{
     uint64_t pageNumMax(size_t trackId);
     bool isRecordingToFile;
     uint64_t lastStats; ///< Time of last sending of stats.
+    void reinitPlaylist(std::string &playlistBuffer, uint64_t &maxAge, uint64_t &maxEntries,
+                        uint64_t &segmentCount, uint64_t &segmentsRemoved, uint64_t &curTime,
+                        std::string targetDuration, HTTP::URL &playlistLocation);
 
     Util::packetSorter buffer; ///< A sorted list of next-to-be-loaded packets.
     bool sought;          ///< If a seek has been done, this is set to true. Used for seeking on
@@ -119,13 +121,13 @@ namespace Mist{
     virtual std::string getConnectedHost();
     virtual std::string getConnectedBinHost();
     virtual std::string getStatsName();
-    virtual bool hasSessionIDs(){return false;}
 
     virtual void connStats(uint64_t now, Comms::Connections &statComm);
 
     std::set<size_t> getSupportedTracks(const std::string &type = "") const;
 
     inline virtual bool keepGoing(){return config->is_active && myConn;}
+    virtual void idleTime(uint64_t ms){Util::sleep(ms);}
 
     Comms::Connections statComm;
     bool isBlocking; ///< If true, indicates that myConn is blocking.

@@ -24,6 +24,7 @@ namespace Mist{
 
   struct playListEntries{
     std::string filename;
+    std::string relative_filename;
     uint64_t bytePos;
     uint64_t mUTC; ///< UTC unix millis timestamp of first packet, if known
     float duration;
@@ -49,19 +50,25 @@ namespace Mist{
   /// Keeps the segment entry list by playlist ID
   extern std::map<uint32_t, std::deque<playListEntries> > listEntries;
 
-  class SegmentDownloader{
+  class SegmentDownloader: public Util::DataCallback{
   public:
     SegmentDownloader();
     HTTP::URIReader segDL;
     char *packetPtr;
     bool loadSegment(const playListEntries &entry);
     bool readNext();
+    virtual void dataCallback(const char *ptr, size_t size);
+    virtual size_t getDataCallbackPos() const;
     void close();
     bool atEnd() const;
 
   private:
     bool encrypted;
+    bool buffered;
+    size_t offset;
+    bool firstPacket;
     Util::ResizeablePointer outData;
+    Util::ResizeablePointer * currBuf;
     size_t encOffset;
     unsigned char tmpIvec[16];
     mbedtls_aes_context aes;
@@ -73,12 +80,13 @@ namespace Mist{
     Playlist(const std::string &uriSrc = "");
     bool isUrl() const;
     bool reload();
-    void addEntry(const std::string &filename, float duration, uint64_t &totalBytes,
+    void addEntry(const std::string & absolute_filename, const std::string &filename, float duration, uint64_t &totalBytes,
                   const std::string &key, const std::string &keyIV);
     bool isSupportedFile(const std::string filename);
 
     std::string uri; // link to the current playlistfile
     HTTP::URL root;
+    std::string relurl;
 
     uint64_t reloadNext;
 
@@ -162,7 +170,7 @@ namespace Mist{
 
     bool readIndex();
     bool initPlaylist(const std::string &uri, bool fullInit = true);
-    bool readPlaylist(const HTTP::URL &uri, bool fullInit = true);
+    bool readPlaylist(const HTTP::URL &uri, const std::string & relurl, bool fullInit = true);
     bool readNextFile();
 
     void parseStreamHeader();

@@ -3,6 +3,7 @@ executables += {
   'name': 'MistController', 
   'sources' : [
     files( 'controller.cpp',
+           'controller_external_writers.cpp',
            'controller_updater.cpp',
            'controller_streams.cpp',
            'controller_storage.cpp',
@@ -12,7 +13,8 @@ executables += {
            'controller_capabilities.cpp',
            'controller_uplink.cpp',
            'controller_api.cpp',
-           'controller_push.cpp'),
+           'controller_push.cpp',
+           'controller_variables.cpp'),
     header_tgts,
     server_html],
   'defines': [],
