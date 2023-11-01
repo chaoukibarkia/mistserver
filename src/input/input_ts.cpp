@@ -241,7 +241,26 @@ namespace Mist{
     capa["optional"]["segmentsize"]["name"] = "Segment size (ms)";
     capa["optional"]["segmentsize"]["help"] = "Target time duration in milliseconds for segments.";
     capa["optional"]["segmentsize"]["type"] = "uint";
-    capa["optional"]["segmentsize"]["default"] = 1900;
+    capa["optional"]["segmentsize"]["default"] = DEFAULT_FRAGMENT_DURATION;
+
+    capa["optional"]["datatrack"]["name"] = "MPEG Data track parser";
+    capa["optional"]["datatrack"]["help"] = "Which parser to use for data tracks";
+    capa["optional"]["datatrack"]["type"] = "select";
+    capa["optional"]["datatrack"]["option"] = "--datatrack";
+    capa["optional"]["datatrack"]["short"] = "D";
+    capa["optional"]["datatrack"]["default"] = "";
+    capa["optional"]["datatrack"]["select"][0u][0u] = "";
+    capa["optional"]["datatrack"]["select"][0u][1u] = "None / disabled";
+    capa["optional"]["datatrack"]["select"][1u][0u] = "json";
+    capa["optional"]["datatrack"]["select"][1u][1u] = "2b size-prepended JSON";
+
+    JSON::Value option;
+    option["long"] = "datatrack";
+    option["short"] = "D";
+    option["arg"] = "string";
+    option["default"] = "";
+    option["help"] = "Which parser to use for data tracks";
+    config->addOption("datatrack", option);
 
     capa["optional"]["fallback_stream"]["name"] = "Fallback stream";
     capa["optional"]["fallback_stream"]["help"] =
@@ -253,7 +272,7 @@ namespace Mist{
     capa["optional"]["raw"]["help"] = "Enable raw MPEG-TS passthrough mode";
     capa["optional"]["raw"]["option"] = "--raw";
 
-    JSON::Value option;
+    option.null();
     option["long"] = "raw";
     option["short"] = "R";
     option["help"] = "Enable raw MPEG-TS passthrough mode";
@@ -277,6 +296,11 @@ namespace Mist{
       config->getOption("input", true).append("ts-exec:srt-live-transmit " + srtUrl.getUrl() + " file://con");
       INFO_MSG("Rewriting SRT source '%s' to '%s'", source.c_str(), config->getString("input").c_str());
     }
+    if (config->getString("datatrack") == "json"){
+      liveStream.setRawDataParser(TS::JSON);
+      tsStream.setRawDataParser(TS::JSON);
+    }
+
     // We call preRun early and, if successful, close the opened reader.
     // This is to ensure we have udpMode/rawMode/standAlone all set properly before the first call to needsLock.
     // The reader must be closed so that the angel process does not have a reader open.
@@ -353,7 +377,11 @@ namespace Mist{
       FILE * inFile = fopen(inCfg.c_str() + 9, "r");
       reader.open(fileno(inFile));
       standAlone = false;
-      return inFile;
+      if (!inFile){
+        Util::logExitReason(ER_READ_START_FAILURE, "Opening input '%s' failed", inCfg.c_str());
+        return false;
+      }
+      return true;
     }
     //Anything else, read through URIReader
     HTTP::URL url = HTTP::localURIResolver().link(inCfg);
@@ -361,7 +389,11 @@ namespace Mist{
     if (url.protocol == "https-ts"){url.protocol = "https";}
     reader.open(url);
     standAlone = reader.isSeekable();
-    return reader;
+    if (!reader){
+      Util::logExitReason(ER_READ_START_FAILURE, "Opening input '%s' failed", inCfg.c_str());
+      return false;
+    }
+    return true;
   }
 
   void inputTS::dataCallback(const char *ptr, size_t size){
@@ -387,7 +419,10 @@ namespace Mist{
   /// for a specific track to metadata. After the entire stream has been read,
   /// it writes the remaining metadata.
   bool inputTS::readHeader(){
-    if (!reader){return false;}
+    if (!reader){
+      Util::logExitReason(ER_READ_START_FAILURE, "Reading header for '%s' failed: Could not open input stream", config->getString("input").c_str());
+      return false;
+    }
     meta.reInit(isSingular() ? streamName : "");
     TS::Packet packet; // to analyse and extract data
     DTSC::Packet headerPack;
@@ -471,7 +506,7 @@ namespace Mist{
     }
 
     if (!thisPacket){
-      INFO_MSG("Could not getNext TS packet!");
+      Util::logExitReason(ER_FORMAT_SPECIFIC, "Could not getNext TS packet!");
       return;
     }
     tsStream.initializeMetadata(meta);
@@ -583,7 +618,7 @@ namespace Mist{
         }
         if (!reader){
           config->is_active = false;
-          Util::logExitReason("end of streamed input");
+          Util::logExitReason(ER_CLEAN_EOF, "end of streamed input");
           return;
         }
       }else{
@@ -635,7 +670,7 @@ namespace Mist{
         if (statComm){
           if (statComm.getStatus() & COMM_STATUS_REQDISCONNECT){
             config->is_active = false;
-            Util::logExitReason("received shutdown request from controller");
+            Util::logExitReason(ER_CLEAN_CONTROLLER_REQ, "received shutdown request from controller");
             return;
           }
           uint64_t now = Util::bootSecs();
@@ -654,7 +689,7 @@ namespace Mist{
           if (hasStarted && !threadTimer.size()){
             if (!isAlwaysOn()){
               config->is_active = false;
-              Util::logExitReason("no active threads and we had input in the past");
+              Util::logExitReason(ER_CLEAN_INACTIVE, "no active threads and we had input in the past");
               return;
             }else{
               liveStream.clear();
@@ -686,7 +721,7 @@ namespace Mist{
       if (Util::bootSecs() - noDataSince > 20){
         if (!isAlwaysOn()){
           config->is_active = false;
-          Util::logExitReason("no packets received for 20 seconds");
+          Util::logExitReason(ER_CLEAN_INACTIVE, "no packets received for 20 seconds");
           return;
         }else{
           noDataSince = Util::bootSecs();

@@ -146,6 +146,25 @@ namespace Mist{
     option["help"] = "Enable raw MPEG-TS passthrough mode";
     config->addOption("raw", option);
 
+    capa["optional"]["datatrack"]["name"] = "MPEG Data track parser";
+    capa["optional"]["datatrack"]["help"] = "Which parser to use for data tracks";
+    capa["optional"]["datatrack"]["type"] = "select";
+    capa["optional"]["datatrack"]["option"] = "--datatrack";
+    capa["optional"]["datatrack"]["short"] = "D";
+    capa["optional"]["datatrack"]["default"] = "";
+    capa["optional"]["datatrack"]["select"][0u][0u] = "";
+    capa["optional"]["datatrack"]["select"][0u][1u] = "None / disabled";
+    capa["optional"]["datatrack"]["select"][1u][0u] = "json";
+    capa["optional"]["datatrack"]["select"][1u][1u] = "2b size-prepended JSON";
+
+    option.null();
+    option["long"] = "datatrack";
+    option["short"] = "D";
+    option["arg"] = "string";
+    option["default"] = "";
+    option["help"] = "Which parser to use for data tracks";
+    config->addOption("datatrack", option);
+
     lastTimeStamp = 0;
     timeStampOffset = 0;
     receiver_ctx = 0;
@@ -156,7 +175,12 @@ namespace Mist{
     rist_destroy(receiver_ctx);
   }
 
-  bool inputTSRIST::checkArguments(){return true;}
+  bool inputTSRIST::checkArguments(){
+    if (config->getString("datatrack") == "json"){
+      tsStream.setRawDataParser(TS::JSON);
+    }
+    return true;
+  }
 
   /// Live Setup of SRT Input. Runs only if we are the "main" thread
   bool inputTSRIST::preRun(){
@@ -167,7 +191,7 @@ namespace Mist{
     standAlone = false;
     HTTP::URL u(source);
     if (u.protocol != "rist"){
-      FAIL_MSG("Input protocol must begin with rist://");
+      Util::logExitReason(ER_FORMAT_SPECIFIC, "Input protocol must begin with rist://");
       return false;
     }
     std::map<std::string, std::string> arguments;
@@ -184,7 +208,7 @@ namespace Mist{
       while (!hasRaw && config->is_active){
         Util::sleep(50);
         if (!bufferActive()){
-          Util::logExitReason("Buffer shut down");
+          Util::logExitReason(ER_SHM_LOST, "Buffer shut down");
           return;
         }
       }
@@ -198,7 +222,7 @@ namespace Mist{
       }else{
         Util::sleep(50);
         if (!bufferActive()){
-          Util::logExitReason("Buffer shut down");
+          Util::logExitReason(ER_SHM_LOST, "Buffer shut down");
           return;
         }
       }
@@ -224,7 +248,7 @@ namespace Mist{
 
   void inputTSRIST::onFail(const std::string & msg){
     FAIL_MSG("%s", msg.c_str());
-    Util::logExitReason(msg.c_str());
+    Util::logExitReason(ER_FORMAT_SPECIFIC, msg.c_str());
   }
 
   bool inputTSRIST::openStreamSource(){

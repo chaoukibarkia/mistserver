@@ -42,6 +42,7 @@ namespace Mist{
     uint64_t currentTime();
     uint64_t startTime();
     uint64_t endTime();
+    uint64_t targetTime();
     void setBlocking(bool blocking);
     bool selectDefaultTracks();
     bool connectToFile(std::string file, bool append = false, Socket::Connection *conn = 0);
@@ -59,7 +60,7 @@ namespace Mist{
     virtual void dropTrack(size_t trackId, const std::string &reason, bool probablyBad = true);
     virtual void onRequest();
     static void listener(Util::Config &conf, int (*callback)(Socket::Connection &S));
-    virtual void initialSeek();
+    virtual void initialSeek(bool dryRun = false);
     uint64_t getMinKeepAway();
     virtual bool liveSeek(bool rateOnly = false);
     virtual bool onFinish(){return false;}
@@ -151,6 +152,9 @@ namespace Mist{
     virtual bool isRecording();
     virtual bool isFileTarget();
     virtual bool isPushing(){return pushing;};
+    std::string getExitTriggerPayload();
+    void recEndTrigger();
+    void outputEndTrigger();
     bool allowPush(const std::string &passwd);
     void waitForStreamPushReady();
 

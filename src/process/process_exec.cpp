@@ -69,6 +69,9 @@ namespace Mist{
         pStat["proc_status_update"]["sink"] = streamName;
         pStat["proc_status_update"]["source"] = opt["source"];
       }
+      if (opt.isMember("target_mask") && !opt["target_mask"].isNull() && opt["target_mask"].asString() != ""){
+        DTSC::trackValidDefault = opt["target_mask"].asInt();
+      }
     }
     bool needsLock(){return false;}
     bool isSingular(){return false;}
@@ -107,7 +110,7 @@ namespace Mist{
       OutEBML::dropTrack(trackId, reason, probablyBad);
     }
     void sendHeader(){
-      if (opt["masksource"].asBool()){
+      if (opt["source_mask"].asBool()){
         for (std::map<size_t, Comms::Users>::iterator ti = userSelect.begin(); ti != userSelect.end(); ++ti){
           if (ti->first == INVALID_TRACK_ID){continue;}
           INFO_MSG("Masking source track %zu", ti->first);
@@ -270,6 +273,7 @@ void sourceThread(void *){
 int main(int argc, char *argv[]){
   DTSC::trackValidMask = TRACK_VALID_INT_PROCESS;
   Util::Config config(argv[0]);
+  Util::Config::binaryType = Util::PROCESS;
   JSON::Value capa;
 
   {

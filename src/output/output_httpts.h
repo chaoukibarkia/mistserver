@@ -7,9 +7,9 @@ namespace Mist{
     OutHTTPTS(Socket::Connection &conn);
     ~OutHTTPTS();
     static void init(Util::Config *cfg);
-    void onHTTP();
+    void respondHTTP(const HTTP::Parser & req, bool headersOnly);
     void sendTS(const char *tsData, size_t len = 188);
-    void initialSeek();
+    void initialSeek(bool dryRun = false);
 
   private:
     bool isRecording();

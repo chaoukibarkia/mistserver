@@ -105,13 +105,13 @@ namespace Mist{
     option["long"] = "segment-size";
     option["short"] = "S";
     option["help"] = "Target time duration in milliseconds for segments";
-    option["value"].append(1900);
+    option["value"].append(DEFAULT_FRAGMENT_DURATION);
     config->addOption("segmentsize", option);
     capa["optional"]["segmentsize"]["name"] = "Segment size (ms)";
     capa["optional"]["segmentsize"]["help"] = "Target time duration in milliseconds for segments.";
     capa["optional"]["segmentsize"]["option"] = "--segment-size";
     capa["optional"]["segmentsize"]["type"] = "uint";
-    capa["optional"]["segmentsize"]["default"] = 1900;
+    capa["optional"]["segmentsize"]["default"] = DEFAULT_FRAGMENT_DURATION;
 
     capa["optional"]["fallback_stream"]["name"] = "Fallback stream";
     capa["optional"]["fallback_stream"]["help"] =
@@ -131,7 +131,7 @@ namespace Mist{
         "streams from everyone, based on a set password, and/or use hostname/IP whitelisting.";
     bufferTime = 50000;
     cutTime = 0;
-    segmentSize = 1900;
+    segmentSize = DEFAULT_FRAGMENT_DURATION;
     hasPush = false;
     everHadPush = false;
     resumeMode = false;
@@ -187,6 +187,10 @@ namespace Mist{
   /// Detected issues in string format, or empty string if no issues
   /// ~~~~~~~~~~~~~~~
   void inputBuffer::updateMeta(){
+    if (!M){
+      Util::logExitReason(ER_SHM_LOST, "Lost connection to metadata");
+      return;
+    }
     static bool wentDry = false;
     static uint64_t lastFragCount = 0xFFFFull;
     static uint32_t lastBPS = 0; /*LTS*/
@@ -329,6 +333,9 @@ namespace Mist{
 
   void inputBuffer::removeUnused(){
     meta.reloadReplacedPagesIfNeeded();
+    if (!meta){
+      return;
+    }
     // first remove all tracks that have not been updated for too long
     bool changed = true;
     while (changed){
@@ -349,6 +356,8 @@ namespace Mist{
       }
       for (std::set<size_t>::iterator idx = tracks.begin(); idx != tracks.end(); idx++){
         size_t i = *idx;
+        //Don't delete idle metadata tracks
+        if (M.getType(i) == "meta"){continue;}
         uint64_t lastUp = M.getLastUpdated(i);
         //Prevent issues when getLastUpdated > current time. This can happen if the second rolls over exactly during this loop.
         if (lastUp >= time){continue;}
@@ -489,7 +498,7 @@ namespace Mist{
     }
     if (hasPush){everHadPush = true;}
     if (!hasPush && everHadPush && !resumeMode && config->is_active){
-      Util::logExitReason("source disconnected for non-resumable stream");
+      Util::logExitReason(ER_CLEAN_EOF, "source disconnected for non-resumable stream");
       if (streamStatus){streamStatus.mapped[0] = STRMSTAT_SHUTDOWN;}
       config->is_active = false;
       userSelect.clear();

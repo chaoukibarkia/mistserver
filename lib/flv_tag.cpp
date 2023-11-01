@@ -502,13 +502,11 @@ bool FLV::Tag::DTSCMetaInit(const DTSC::Meta &M, std::set<size_t> &selTracks){
   int i = 0;
   uint64_t mediaLen = 0;
   for (std::set<size_t>::iterator it = selTracks.begin(); it != selTracks.end(); it++){
-    if (M.getLastms(*it) - M.getFirstms(*it) > mediaLen){
-      mediaLen = M.getLastms(*it) - M.getFirstms(*it);
-    }
+    if (M.getDuration(*it) > mediaLen){mediaLen = M.getDuration(*it);}
     if (M.getType(*it) == "video"){
       trinfo.addContent(AMF::Object("", AMF::AMF0_OBJECT));
       trinfo.getContentP(i)->addContent(AMF::Object(
-          "length", ((double)M.getLastms(*it) / 1000) * ((double)M.getFpks(*it) / 1000.0), AMF::AMF0_NUMBER));
+          "length", ((double)M.getDuration(*it) / 1000) * ((double)M.getFpks(*it) / 1000.0), AMF::AMF0_NUMBER));
       trinfo.getContentP(i)->addContent(AMF::Object("timescale", ((double)M.getFpks(*it) / 1000), AMF::AMF0_NUMBER));
       trinfo.getContentP(i)->addContent(AMF::Object("sampledescription", AMF::AMF0_STRICT_ARRAY));
       amfdata.getContentP(1)->addContent(AMF::Object("hasVideo", 1, AMF::AMF0_BOOL));
@@ -552,7 +550,7 @@ bool FLV::Tag::DTSCMetaInit(const DTSC::Meta &M, std::set<size_t> &selTracks){
     if (M.getType(*it) == "audio"){
       trinfo.addContent(AMF::Object("", AMF::AMF0_OBJECT));
       trinfo.getContentP(i)->addContent(
-          AMF::Object("length", (double)(M.getLastms(*it) * M.getRate(*it)), AMF::AMF0_NUMBER));
+          AMF::Object("length", (double)(M.getDuration(*it) * M.getRate(*it)), AMF::AMF0_NUMBER));
       trinfo.getContentP(i)->addContent(AMF::Object("timescale", M.getRate(*it), AMF::AMF0_NUMBER));
       trinfo.getContentP(i)->addContent(AMF::Object("sampledescription", AMF::AMF0_STRICT_ARRAY));
       amfdata.getContentP(1)->addContent(AMF::Object("hasAudio", 1, AMF::AMF0_BOOL));
@@ -575,7 +573,7 @@ bool FLV::Tag::DTSCMetaInit(const DTSC::Meta &M, std::set<size_t> &selTracks){
     }
   }
   if (M.getVod()){
-    amfdata.getContentP(1)->addContent(AMF::Object("duration", mediaLen / 1000, AMF::AMF0_NUMBER));
+    amfdata.getContentP(1)->addContent(AMF::Object("duration", mediaLen / 1000.0, AMF::AMF0_NUMBER));
   }
   amfdata.getContentP(1)->addContent(trinfo);
 
@@ -825,7 +823,21 @@ void FLV::Tag::toMeta(DTSC::Meta &meta, AMF::Object &amf_storage, size_t &reTrac
   case 0x12: trackType = "meta"; break;  // meta
   }
 
+  if (meta.getVod() && reTrack == INVALID_TRACK_ID){
+    reTrack = meta.trackIDToIndex(getTrackID(), getpid());
+  }
+
+  if (reTrack == INVALID_TRACK_ID){
+    reTrack = meta.addTrack();
+    meta.setID(reTrack, getTrackID());
+    if (targetParams.count("lang")){
+      meta.setLang(reTrack, targetParams.at("lang"));
+    }
+  }
+
   if (data[0] == 0x12){
+    meta.setType(reTrack, "meta");
+    meta.setCodec(reTrack, "JSON");
     AMF::Object meta_in = AMF::parse((unsigned char *)data + 11, len - 15);
     AMF::Object *tmp = 0;
     if (meta_in.getContentP(1) && meta_in.getContentP(0) && (meta_in.getContentP(0)->StrValue() == "onMetaData")){
@@ -837,18 +849,6 @@ void FLV::Tag::toMeta(DTSC::Meta &meta, AMF::Object &amf_storage, size_t &reTrac
     }
     if (tmp){amf_storage = *tmp;}
     return;
-  }
-
-  if (meta.getVod() && reTrack == INVALID_TRACK_ID){
-    reTrack = meta.trackIDToIndex(getTrackID(), getpid());
-  }
-
-  if (reTrack == INVALID_TRACK_ID){
-    reTrack = meta.addTrack();
-    meta.setID(reTrack, getTrackID());
-    if (targetParams.count("lang")){
-      meta.setLang(reTrack, targetParams.at("lang"));
-    }
   }
 
   std::string codec = meta.getCodec(reTrack);

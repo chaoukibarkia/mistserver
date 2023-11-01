@@ -52,10 +52,10 @@ namespace Mist{
 
   OutHTTPTS::~OutHTTPTS(){}
 
-  void OutHTTPTS::initialSeek(){
+  void OutHTTPTS::initialSeek(bool dryRun){
     // Adds passthrough support to the regular initialSeek function
     if (targetParams.count("passthrough")){selectAllTracks();}
-    Output::initialSeek();
+    Output::initialSeek(dryRun);
   }
 
   void OutHTTPTS::init(Util::Config *cfg){
@@ -74,6 +74,7 @@ namespace Mist{
     capa["codecs"][0u][1u].append("+AC3");
     capa["codecs"][0u][1u].append("+MP2");
     capa["codecs"][0u][1u].append("+opus");
+    capa["codecs"][0u][2u].append("+JSON");
     capa["codecs"][1u][0u].append("rawts");
     capa["methods"][0u]["handler"] = "http";
     capa["methods"][0u]["type"] = "html5/video/mpeg";
@@ -110,26 +111,14 @@ namespace Mist{
 
   bool OutHTTPTS::isRecording(){return config->getString("target").size();}
 
-  void OutHTTPTS::onHTTP(){
-    std::string method = H.method;
-    initialize();
-    H.clearHeader("Range");
-    H.clearHeader("Icy-MetaData");
-    H.clearHeader("User-Agent");
-    H.clearHeader("Host");
-    H.clearHeader("Accept-Ranges");
-    H.clearHeader("transferMode.dlna.org");
-    H.SetHeader("Content-Type", "video/mpeg");
-    H.setCORSHeaders();
-    if (method == "OPTIONS" || method == "HEAD"){
-      H.SendResponse("200", "OK", myConn);
-      H.Clean();
-      return;
+  void OutHTTPTS::respondHTTP(const HTTP::Parser & req, bool headersOnly){
+    HTTPOutput::respondHTTP(req, headersOnly);
+    H.protocol = "HTTP/1.0";
+    H.SendResponse("200", "OK", myConn);
+    if (!headersOnly){
+      parseData = true;
+      wantRequest = false;
     }
-    H.protocol = "HTTP/1.0"; // Force HTTP/1.0 because some devices just don't understand chunked replies
-    H.StartResponse(H, myConn);
-    parseData = true;
-    wantRequest = false;
   }
 
   void OutHTTPTS::sendTS(const char *tsData, size_t len){

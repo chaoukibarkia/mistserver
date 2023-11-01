@@ -740,7 +740,10 @@ namespace Mist{
       return false;
     }
 
-    if (!initPlaylist(config->getString("input"), false)){return false;}
+    if (!initPlaylist(config->getString("input"), false)){
+      Util::logExitReason(ER_UNKNOWN, "Failed to load HLS playlist, aborting");
+      return false;
+    }
 
     // If the playlist is of event type, init the amount of segments in the playlist
     if (isLiveDVR){
@@ -756,10 +759,13 @@ namespace Mist{
 
   void inputHLS::parseStreamHeader(){
     if (!initPlaylist(config->getString("input"))){
-      FAIL_MSG("Failed to load HLS playlist, aborting");
+      Util::logExitReason(ER_UNKNOWN, "Failed to load HLS playlist, aborting");
       return;
     }
+    uint64_t oldBootMsOffset = M.getBootMsOffset();
     meta.reInit(isSingular() ? streamName : "", false);
+    meta.setUTCOffset(zUTC);
+    meta.setBootMsOffset(oldBootMsOffset);
     INFO_MSG("Parsing live stream to create header...");
     TS::Packet packet; // to analyse and extract data
     int pidCounter = 1;
@@ -828,7 +834,7 @@ namespace Mist{
       INFO_MSG("Could not read existing header, regenerating");
       return false;
     }
-    if (!M.inputLocalVars.isMember("version") || M.inputLocalVars["version"].asInt() < 3){
+    if (!M.inputLocalVars.isMember("version") || M.inputLocalVars["version"].asInt() < 4){
       INFO_MSG("Header needs update, regenerating");
       return false;
     }
@@ -885,9 +891,9 @@ namespace Mist{
       pidMapping[val] = key;
     }
     // Set bootMsOffset in order to display the program time correctly in the player
-    streamOffset = M.inputLocalVars["streamoffset"].asInt();
-    if (meta.getLive()){meta.setUTCOffset(streamOffset + (Util::unixMS() - Util::bootMS()));}
-    meta.setBootMsOffset(streamOffset);
+    zUTC = M.inputLocalVars["zUTC"].asInt();
+    meta.setUTCOffset(zUTC);
+    if (M.getLive()){meta.setBootMsOffset(streamOffset);}
     return true;
   }
 
@@ -996,12 +1002,12 @@ namespace Mist{
     if (!config->is_active){return false;}
 
     // set bootMsOffset in order to display the program time correctly in the player
-    if (meta.getLive()){meta.setUTCOffset(streamOffset + (Util::unixMS() - Util::bootMS()));}
-    meta.setBootMsOffset(streamOffset);
+    meta.setUTCOffset(zUTC);
+    if (M.getLive()){meta.setBootMsOffset(streamOffset);}
     if (streamIsLive || isLiveDVR){return true;}
 
     // Set local vars used for parsing existing headers
-    meta.inputLocalVars["version"] = 3;
+    meta.inputLocalVars["version"] = 4;
 
     // Write playlist entry info
     JSON::Value allEntries;
@@ -1026,7 +1032,7 @@ namespace Mist{
     }
     meta.inputLocalVars["playlist_urls"] = playlist_urls;
     meta.inputLocalVars["playlistEntries"] = allEntries;
-    meta.inputLocalVars["streamoffset"] = streamOffset;
+    meta.inputLocalVars["zUTC"] = zUTC;
 
     // Write packet ID mappings
     JSON::Value thisMappingsR;
@@ -1195,7 +1201,7 @@ namespace Mist{
           tsStream.getPacket(tid, thisPacket);
         }
         if (!thisPacket){
-          FAIL_MSG("Could not getNext TS packet!");
+          Util::logExitReason(ER_FORMAT_SPECIFIC, "Could not getNext TS packet!");
           return;
         }
 
@@ -1256,7 +1262,7 @@ namespace Mist{
 
       // Nothing works!
       // HLS input will now quit trying to prevent severe mental depression.
-      INFO_MSG("No packets can be read - exhausted all playlists");
+      Util::logExitReason(ER_CLEAN_EOF, "No packets can be read - exhausted all playlists");
       thisPacket.null();
       return;
     }
@@ -1481,14 +1487,14 @@ namespace Mist{
       INFO_MSG("Downloading main playlist file from '%s'", uri.c_str());
       HTTP::URIReader plsDL;
       if (!plsDL.open(playlistRootPath) || !plsDL){
-        FAIL_MSG("Could not open main playlist, aborting");
+        Util::logExitReason(ER_READ_START_FAILURE, "Could not open main playlist, aborting");
         return false;
       }
       char * dataPtr;
       size_t dataLen;
       plsDL.readAll(dataPtr, dataLen);
       if (!dataLen){
-        FAIL_MSG("Could not download main playlist, aborting.");
+        Util::logExitReason(ER_READ_START_FAILURE, "Could not download main playlist, aborting.");
         return false;
       }
       urlSource.str(std::string(dataPtr, dataLen));
@@ -1503,7 +1509,7 @@ namespace Mist{
       }
       fileSource.open(playlistLocation.c_str());
       if (!fileSource.good()){
-        FAIL_MSG("Could not open playlist (%s): %s", strerror(errno), playlistLocation.c_str());
+        Util::logExitReason(ER_READ_START_FAILURE, "Could not open playlist (%s): %s", strerror(errno), playlistLocation.c_str());
       }
     }
 
@@ -1596,6 +1602,8 @@ namespace Mist{
         INFO_MSG("Setting program unix start time to '%s' (%" PRIu64 ")", line.substr(pos + 1).c_str(), zUTC);
         // store offset so that we can set it after reading the header
         streamOffset = zUTC - (Util::unixMS() - Util::bootMS());
+        meta.setUTCOffset(zUTC);
+        if (M.getLive()){meta.setBootMsOffset(streamOffset);}
       }else{
         // ignore wrong lines
         VERYHIGH_MSG("ignore wrong line: %s", line.c_str());

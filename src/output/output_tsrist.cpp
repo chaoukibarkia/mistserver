@@ -167,7 +167,7 @@ namespace Mist{
         if (!newStream.size()){
           FAIL_MSG("Push from %s to URL %s rejected - PUSH_REWRITE trigger blanked the URL",
                    getConnectedHost().c_str(), reqUrl.getUrl().c_str());
-          Util::logExitReason(
+          Util::logExitReason(ER_TRIGGER,
               "Push from %s to URL %s rejected - PUSH_REWRITE trigger blanked the URL",
               getConnectedHost().c_str(), reqUrl.getUrl().c_str());
           onFinish();
@@ -180,6 +180,9 @@ namespace Mist{
       if (!allowPush("")){
         onFinish();
         return;
+      }
+      if (config->getString("datatrack") == "json"){
+        tsIn.setRawDataParser(TS::JSON);
       }
       parseData = false;
       wantRequest = true;
@@ -225,6 +228,7 @@ namespace Mist{
     capa["codecs"][0u][1u].append("+AC3");
     capa["codecs"][0u][1u].append("+MP2");
     capa["codecs"][0u][1u].append("+opus");
+    capa["codecs"][0u][2u].append("+JSON");
     capa["codecs"][1u][0u].append("rawts");
 
     capa["optional"]["profile"]["name"] = "RIST profile";
@@ -283,6 +287,25 @@ namespace Mist{
     opt["arg_num"] = 1;
     opt["help"] = "Target rist:// URL to push out towards.";
     cfg->addOption("target", opt);
+
+    opt.null();
+    opt["long"] = "datatrack";
+    opt["short"] = "D";
+    opt["arg"] = "string";
+    opt["default"] = "";
+    opt["help"] = "Which parser to use for data tracks";
+    config->addOption("datatrack", opt);
+
+    capa["optional"]["datatrack"]["name"] = "MPEG Data track parser";
+    capa["optional"]["datatrack"]["help"] = "Which parser to use for data tracks";
+    capa["optional"]["datatrack"]["type"] = "select";
+    capa["optional"]["datatrack"]["option"] = "--datatrack";
+    capa["optional"]["datatrack"]["short"] = "D";
+    capa["optional"]["datatrack"]["default"] = "";
+    capa["optional"]["datatrack"]["select"][0u][0u] = "";
+    capa["optional"]["datatrack"]["select"][0u][1u] = "None / disabled";
+    capa["optional"]["datatrack"]["select"][1u][0u] = "json";
+    capa["optional"]["datatrack"]["select"][1u][1u] = "2b size-prepended JSON";
   }
 
   // Buffers TS packets and sends after 7 are buffered.
@@ -390,14 +413,14 @@ void handleUSR1(int signum, siginfo_t *sigInfo, void *ignore){
   if (!sockCount){
     INFO_MSG("USR1 received - triggering rolling restart (no connections active)");
     Util::Config::is_restarting = true;
-    Util::logExitReason("signal USR1, no connections");
+    Util::logExitReason(ER_CLEAN_SIGNAL, "signal USR1, no connections");
     ///\TODO Update for RIST
     //server_socket.close();
     Util::Config::is_active = false;
   }else{
     INFO_MSG("USR1 received - triggering rolling restart when connection count reaches zero");
     Util::Config::is_restarting = true;
-    Util::logExitReason("signal USR1, after disconnect wait");
+    Util::logExitReason(ER_CLEAN_SIGNAL, "signal USR1, after disconnect wait");
   }
 }
 
@@ -405,6 +428,7 @@ int main(int argc, char *argv[]){
   DTSC::trackValidMask = TRACK_VALID_EXT_HUMAN;
   Util::redirectLogsIfNeeded();
   Util::Config conf(argv[0]);
+  Util::Config::binaryType = Util::OUTPUT;
   mistOut::init(&conf);
   if (conf.parseArgs(argc, argv)){
     if (conf.getBool("json")){
@@ -446,6 +470,7 @@ int main(int argc, char *argv[]){
       sigaction(SIGUSR1, &new_action, NULL);
     }
     if (conf.getInteger("port") && conf.getString("interface").size()){
+      Comms::defaultCommFlags = COMM_STATUS_NOKILL;
 
       if (rist_receiver_create(&rec_ctx, (rist_profile)conf.getInteger("profile"), &Mist::log_settings) != 0){
         FAIL_MSG("Failed to create receiver context");
